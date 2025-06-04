@@ -115,8 +115,6 @@ def hand_inference(input_queue, output_queue):
 
 def display_frame(queue):
     print("Display Process: Đang chạy...")
-    prev_frame_time = 0 
-    new_frame_time = 0
 
     while True:
         try:
@@ -129,12 +127,6 @@ def display_frame(queue):
         if frame is None:
             print("Display Process: Nhận tín hiệu thoát, thoát.")
             break
-
-        new_frame_time = time.time()
-        fps = 1 / (new_frame_time - prev_frame_time)
-        prev_frame_time = new_frame_time
-        fps_text = f"FPS: {int(fps)}"
-        cv2.putText(frame, fps_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
         cv2.imshow("Hand Gesture (Optimized)", frame)
 

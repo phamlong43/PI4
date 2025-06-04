@@ -117,15 +117,17 @@ class FingerprintGUI:
 
     def authenticate_user(self):
         self.log_insert("Please place your finger to authenticate...")
-        fid = fapp.search_finger()
+        fid, confidence = fapp.search_finger()
         if fid is None:
-            self.log_insert("Fingerprint not recognized.")
+            # Nếu muốn, có thể phân biệt thêm để không báo lỗi ngay
+            self.log_insert("No finger detected yet.")
             return
         name = self.db.get(str(fid), None)
         if name:
-            self.log_insert(f"Authenticated: {name}")
+            self.log_insert(f"Authenticated: {name} (Confidence: {confidence})")
         else:
             self.log_insert(f"Fingerprint ID {fid} found but no associated name.")
+
 
 def main():
     root = tk.Tk()

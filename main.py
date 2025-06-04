@@ -1,137 +1,118 @@
-import tkinter as tk
-from tkinter import messagebox
+# fingerprint_app.py
+
 import json
-import fingerprint as fp
+import os
+from fingerprint import (
+    finger,
+    get_fingerprint,
+    enroll_finger,
+    delete_finger,
+    read_templates,
+    get_finger_id,
+    get_confidence
+)
 
-DATA_FILE = "finger_names.json"
+USER_FILE = "users.json"
 
-def load_data():
-    try:
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    except:
+def load_users():
+    if not os.path.exists(USER_FILE):
         return {}
+    with open(USER_FILE, "r") as f:
+        return json.load(f)
 
-def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+def save_users(users):
+    with open(USER_FILE, "w") as f:
+        json.dump(users, f)
 
-class FingerprintApp:
-    def __init__(self, root):
-        self.root = root
-        root.title("Fingerprint Auth System")
+def get_num():
+    """Use input() to get a valid number from 1 to 127. Retry till success!"""
+    i = 0
+    while (i > 127) or (i < 1):
+        try:
+            i = int(input("Enter ID # from 1-127: "))
+        except ValueError:
+            pass
+    return i
 
-        self.data = load_data()
-
-        tk.Label(root, text="Name:").grid(row=0, column=0)
-        self.name_var = tk.StringVar()
-        tk.Entry(root, textvariable=self.name_var).grid(row=0, column=1)
-
-        self.log_text = tk.Text(root, width=50, height=15)
-        self.log_text.grid(row=3, column=0, columnspan=3)
-
-        tk.Button(root, text="Add / Enroll", command=self.enroll).grid(row=1, column=0)
-        tk.Button(root, text="Delete", command=self.delete).grid(row=1, column=1)
-        tk.Button(root, text="Authenticate", command=self.authenticate).grid(row=1, column=2)
-
-        self.status_label = tk.Label(root, text="Ready")
-        self.status_label.grid(row=2, column=0, columnspan=3)
-
-        fp.read_templates()
-
-    def log(self, message):
-        self.log_text.insert(tk.END, message + "\n")
-        self.log_text.see(tk.END)
-
-    def find_next_id(self):
-        used_ids = set(int(k) for k in self.data.keys())
-        for i in range(1, 128):
-            if i not in used_ids:
-                return i
-        return None
-
-    def enroll(self):
-        name = self.name_var.get().strip()
-        if not name:
-            messagebox.showwarning("Input error", "Please enter a name.")
+def enroll_or_update_finger():
+    location = get_num()
+    users = load_users()
+    
+    if str(location) in users:
+        print(f"User ID {location} already exists with name: {users[str(location)]}")
+        update = input("Do you want to update fingerprint and/or name? (y/n): ")
+        if update.lower() != 'y':
+            print("Cancelled.")
             return
 
-        # Nếu tên đã có, hỏi có muốn ghi đè (sửa)
-        existing_id = None
-        for k, v in self.data.items():
-            if v == name:
-                existing_id = int(k)
-                break
+    # Tiến hành enroll như bình thường
+    if enroll_finger(location):
+        # Sau enroll thành công, nhập tên mới
+        new_name = input("Enter name for user ID {}: ".format(location))
+        users[str(location)] = new_name
+        save_users(users)
+        print("Fingerprint and name stored successfully.")
+    else:
+        print("Failed to enroll fingerprint.")
 
-        if existing_id:
-            if not messagebox.askyesno("Confirm", f"Name '{name}' exists. Do you want to overwrite?"):
-                return
-            # Xóa mẫu cũ
-            if fp.delete_finger(existing_id):
-                self.log(f"Deleted old fingerprint ID {existing_id} for {name}")
-            else:
-                self.log(f"Failed to delete old fingerprint ID {existing_id}")
+def edit_name():
+    users = load_users()
+    user_id = get_num()
+    if str(user_id) not in users:
+        print("User ID not found.")
+        return
+    new_name = input("Enter new name for user ID {}: ".format(user_id))
+    users[str(user_id)] = new_name
+    save_users(users)
+    print(f"Name updated for ID {user_id} -> {new_name}")
 
-            use_id = existing_id
+def delete_finger_and_name():
+    user_id = get_num()
+    if delete_finger(user_id) == finger.OK:
+        users = load_users()
+        user_id_str = str(user_id)
+        if user_id_str in users:
+            users.pop(user_id_str)
+            save_users(users)
+        print("Deleted fingerprint and user name for ID:", user_id)
+    else:
+        print("Failed to delete fingerprint.")
+
+def find_finger():
+    if get_fingerprint():
+        users = load_users()
+        user_name = users.get(str(get_finger_id()), "Unknown User")
+        print(f"Detected user: {user_name} (ID: {get_finger_id()}) with confidence {get_confidence()}")
+    else:
+        print("Finger not found")
+
+def main():
+    while True:
+        if read_templates() != finger.OK:
+            raise RuntimeError("Failed to read templates")
+        print("----------------")
+        print("Fingerprint templates:", finger.templates)
+        print("e) enroll or update fingerprint")
+        print("f) find fingerprint")
+        print("d) delete fingerprint")
+        print("n) edit user name")
+        print("q) quit")
+        print("----------------")
+        c = input("> ")
+
+        if c == "e":
+            enroll_or_update_finger()
+        elif c == "f":
+            find_finger()
+        elif c == "d":
+            delete_finger_and_name()
+        elif c == "n":
+            edit_name()
+        elif c == "q":
+            print("Exiting.")
+            break
         else:
-            use_id = self.find_next_id()
-            if not use_id:
-                messagebox.showerror("Error", "No available fingerprint ID slots!")
-                return
-
-        self.status_label.config(text=f"Please place finger twice to enroll '{name}' (ID {use_id})", fg="blue")
-        self.root.update()
-
-        success = fp.enroll_finger(use_id)
-        if success:
-            self.data[str(use_id)] = name
-            save_data(self.data)
-            self.status_label.config(text=f"Enrollment successful for '{name}' (ID {use_id})", fg="green")
-            self.log(f"Enrolled fingerprint for '{name}' with ID {use_id}")
-        else:
-            self.status_label.config(text="Enrollment failed", fg="red")
-            self.log("Enrollment failed")
-
-    def delete(self):
-        name = self.name_var.get().strip()
-        if not name:
-            messagebox.showwarning("Input error", "Please enter a name.")
-            return
-
-        delete_id = None
-        for k, v in self.data.items():
-            if v == name:
-                delete_id = int(k)
-                break
-
-        if not delete_id:
-            messagebox.showinfo("Info", f"No fingerprint found for '{name}'")
-            return
-
-        if messagebox.askyesno("Confirm", f"Are you sure to delete fingerprint for '{name}'?"):
-            if fp.delete_finger(delete_id):
-                self.log(f"Deleted fingerprint ID {delete_id} for '{name}'")
-                del self.data[str(delete_id)]
-                save_data(self.data)
-                self.status_label.config(text=f"Deleted fingerprint for '{name}'", fg="green")
-            else:
-                self.status_label.config(text=f"Failed to delete fingerprint for '{name}'", fg="red")
-                self.log(f"Failed to delete fingerprint ID {delete_id}")
-
-    def authenticate(self):
-        self.status_label.config(text="Place finger for authentication...", fg="blue")
-        self.root.update()
-        result = fp.search_finger()
-        if result:
-            fid, confidence = result
-            name = self.data.get(str(fid), "Unknown")
-            self.status_label.config(text=f"Fingerprint matched: {name} (ID {fid}), confidence {confidence}", fg="green")
-            self.log(f"Authenticated: {name} (ID {fid}) confidence={confidence}")
-        else:
-            self.status_label.config(text="No match found", fg="red")
-            self.log("Authentication failed")
+            print("Invalid choice.")
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = FingerprintApp(root)
-    root.mainloop()
+    main()

@@ -1,111 +1,135 @@
 import tkinter as tk
-from tkinter import ttk, simpledialog, messagebox
-import fingerprint_functions as fp
+from tkinter import messagebox
+import json
+import fingerprint as fp
+
+DATA_FILE = "finger_names.json"
+
+def load_data():
+    try:
+        with open(DATA_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_data(data):
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f, indent=2)
 
 class FingerprintApp:
     def __init__(self, root):
         self.root = root
-        root.title("Quản lý và xác thực vân tay")
+        root.title("Fingerprint Auth System")
 
-        frame_inputs = ttk.Frame(root, padding=10)
-        frame_inputs.pack()
+        self.data = load_data()
 
-        ttk.Label(frame_inputs, text="Tên:").grid(row=0, column=0, sticky="w")
-        self.name_entry = ttk.Entry(frame_inputs, width=25)
-        self.name_entry.grid(row=0, column=1, padx=5, pady=5)
+        tk.Label(root, text="Name:").grid(row=0, column=0)
+        self.name_var = tk.StringVar()
+        tk.Entry(root, textvariable=self.name_var).grid(row=0, column=1)
 
-        frame_buttons = ttk.Frame(root, padding=10)
-        frame_buttons.pack()
+        self.log_text = tk.Text(root, width=50, height=15)
+        self.log_text.grid(row=3, column=0, columnspan=3)
 
-        self.enroll_btn = ttk.Button(frame_buttons, text="Thêm vân tay", command=self.enroll)
-        self.enroll_btn.grid(row=0, column=0, padx=5, pady=5)
+        tk.Button(root, text="Add / Enroll", command=self.enroll).grid(row=1, column=0)
+        tk.Button(root, text="Delete", command=self.delete).grid(row=1, column=1)
+        tk.Button(root, text="Authenticate", command=self.authenticate).grid(row=1, column=2)
 
-        self.edit_btn = ttk.Button(frame_buttons, text="Sửa tên", command=self.edit_name)
-        self.edit_btn.grid(row=0, column=1, padx=5, pady=5)
+        self.status_label = tk.Label(root, text="Ready")
+        self.status_label.grid(row=2, column=0, columnspan=3)
 
-        self.delete_btn = ttk.Button(frame_buttons, text="Xóa vân tay", command=self.delete)
-        self.delete_btn.grid(row=0, column=2, padx=5, pady=5)
-
-        self.auth_btn = ttk.Button(root, text="Xác thực vân tay", command=self.authenticate)
-        self.auth_btn.pack(pady=10, fill='x')
-
-        self.status_label = ttk.Label(root, text="Sẵn sàng", font=("Arial", 14))
-        self.status_label.pack(pady=5)
-
-        self.log_text = tk.Text(root, height=10, width=60, state='disabled', bg="#f0f0f0")
-        self.log_text.pack(pady=5)
+        fp.read_templates()
 
     def log(self, message):
-        self.log_text.config(state='normal')
         self.log_text.insert(tk.END, message + "\n")
         self.log_text.see(tk.END)
-        self.log_text.config(state='disabled')
 
-    def get_name(self):
-        name = self.name_entry.get().strip()
-        if not name:
-            messagebox.showerror("Lỗi", "Vui lòng nhập tên")
-            return None
-        return name
+    def find_next_id(self):
+        used_ids = set(int(k) for k in self.data.keys())
+        for i in range(1, 128):
+            if i not in used_ids:
+                return i
+        return None
 
     def enroll(self):
-        name = self.get_name()
-        if name is None:
+        name = self.name_var.get().strip()
+        if not name:
+            messagebox.showwarning("Input error", "Please enter a name.")
             return
-        self.status_label.config(text="Đang đăng ký vân tay...", foreground="blue")
+
+        # Nếu tên đã có, hỏi có muốn ghi đè (sửa)
+        existing_id = None
+        for k, v in self.data.items():
+            if v == name:
+                existing_id = int(k)
+                break
+
+        if existing_id:
+            if not messagebox.askyesno("Confirm", f"Name '{name}' exists. Do you want to overwrite?"):
+                return
+            # Xóa mẫu cũ
+            if fp.delete_finger(existing_id):
+                self.log(f"Deleted old fingerprint ID {existing_id} for {name}")
+            else:
+                self.log(f"Failed to delete old fingerprint ID {existing_id}")
+
+            use_id = existing_id
+        else:
+            use_id = self.find_next_id()
+            if not use_id:
+                messagebox.showerror("Error", "No available fingerprint ID slots!")
+                return
+
+        self.status_label.config(text=f"Please place finger twice to enroll '{name}' (ID {use_id})", fg="blue")
         self.root.update()
 
-        success = fp.enroll_finger_auto(name)
+        success = fp.enroll_finger(use_id)
         if success:
-            self.status_label.config(text=f"Đăng ký thành công cho {name}", foreground="green")
-            self.log(f"Đã đăng ký vân tay cho {name}")
+            self.data[str(use_id)] = name
+            save_data(self.data)
+            self.status_label.config(text=f"Enrollment successful for '{name}' (ID {use_id})", fg="green")
+            self.log(f"Enrolled fingerprint for '{name}' with ID {use_id}")
         else:
-            self.status_label.config(text="Đăng ký thất bại hoặc tên đã tồn tại", foreground="red")
-            self.log(f"Lỗi khi đăng ký vân tay cho {name}")
-
-    def edit_name(self):
-        old_name = self.get_name()
-        if old_name is None:
-            return
-        new_name = simpledialog.askstring("Sửa tên", "Nhập tên mới:")
-        if not new_name:
-            self.status_label.config(text="Hủy sửa tên", foreground="orange")
-            return
-        success = fp.update_username_by_name(old_name, new_name)
-        if success:
-            self.status_label.config(text=f"Đã đổi tên {old_name} thành {new_name}", foreground="green")
-            self.log(f"Đổi tên {old_name} → {new_name}")
-        else:
-            self.status_label.config(text=f"Không tìm thấy tên {old_name} hoặc tên mới đã tồn tại", foreground="red")
-            self.log(f"Lỗi khi đổi tên {old_name}")
+            self.status_label.config(text="Enrollment failed", fg="red")
+            self.log("Enrollment failed")
 
     def delete(self):
-        name = self.get_name()
-        if name is None:
+        name = self.name_var.get().strip()
+        if not name:
+            messagebox.showwarning("Input error", "Please enter a name.")
             return
-        confirm = messagebox.askyesno("Xác nhận xóa", f"Bạn có chắc muốn xóa vân tay của {name}?")
-        if not confirm:
-            self.status_label.config(text="Hủy xóa", foreground="orange")
+
+        delete_id = None
+        for k, v in self.data.items():
+            if v == name:
+                delete_id = int(k)
+                break
+
+        if not delete_id:
+            messagebox.showinfo("Info", f"No fingerprint found for '{name}'")
             return
-        success = fp.delete_finger_by_name(name)
-        if success:
-            self.status_label.config(text=f"Đã xóa vân tay của {name}", foreground="green")
-            self.log(f"Xóa vân tay {name} thành công")
-        else:
-            self.status_label.config(text="Xóa thất bại hoặc không tìm thấy tên", foreground="red")
-            self.log(f"Lỗi khi xóa vân tay {name}")
+
+        if messagebox.askyesno("Confirm", f"Are you sure to delete fingerprint for '{name}'?"):
+            if fp.delete_finger(delete_id):
+                self.log(f"Deleted fingerprint ID {delete_id} for '{name}'")
+                del self.data[str(delete_id)]
+                save_data(self.data)
+                self.status_label.config(text=f"Deleted fingerprint for '{name}'", fg="green")
+            else:
+                self.status_label.config(text=f"Failed to delete fingerprint for '{name}'", fg="red")
+                self.log(f"Failed to delete fingerprint ID {delete_id}")
 
     def authenticate(self):
-        self.status_label.config(text="Vui lòng đặt ngón tay lên cảm biến...", foreground="blue")
+        self.status_label.config(text="Place finger for authentication...", fg="blue")
         self.root.update()
-
-        success, username = fp.authenticate_finger()
-        if success:
-            self.status_label.config(text=f"Xác thực thành công - Chào mừng {username}", foreground="green")
-            self.log(f"Xác thực thành công: {username}")
+        result = fp.search_finger()
+        if result:
+            fid, confidence = result
+            name = self.data.get(str(fid), "Unknown")
+            self.status_label.config(text=f"Fingerprint matched: {name} (ID {fid}), confidence {confidence}", fg="green")
+            self.log(f"Authenticated: {name} (ID {fid}) confidence={confidence}")
         else:
-            self.status_label.config(text="Xác thực thất bại", foreground="red")
-            self.log("Xác thực thất bại")
+            self.status_label.config(text="No match found", fg="red")
+            self.log("Authentication failed")
 
 if __name__ == "__main__":
     root = tk.Tk()

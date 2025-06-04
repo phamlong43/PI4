@@ -1,24 +1,36 @@
+# fingerprint_sensor.py
+# SPDX-FileCopyrightText: 2021 ladyada for Adafruit Industries
+# SPDX-License-Identifier: MIT
+
 import time
 import board
 from digitalio import DigitalInOut, Direction
 import adafruit_fingerprint
-import serial
+import serial  # Use pyserial
 
+led = DigitalInOut(board.D13)
+led.direction = Direction.OUTPUT
+
+# Use pyserial instead of busio
 uart = serial.Serial("/dev/ttyS0", baudrate=57600, timeout=1)
+
 finger = adafruit_fingerprint.Adafruit_Fingerprint(uart)
 
-def read_templates():
-    return finger.read_templates()
-
-def get_templates():
-    # Trả về list ID mẫu có trong cảm biến
-    return finger.templates
+def get_fingerprint():
+    """Get a fingerprint image, template it, and see if it matches!"""
+    print("Waiting for image...")
+    while finger.get_image() != adafruit_fingerprint.OK:
+        pass
+    print("Templating...")
+    if finger.image_2_tz(1) != adafruit_fingerprint.OK:
+        return False
+    print("Searching...")
+    if finger.finger_search() != adafruit_fingerprint.OK:
+        return False
+    return True
 
 def enroll_finger(location):
-    """
-    Yêu cầu đặt ngón tay 2 lần, lưu mẫu tại vị trí location.
-    Trả về True nếu thành công.
-    """
+    """Take 2 finger images and template them, then store in 'location'"""
     for fingerimg in range(1, 3):
         if fingerimg == 1:
             print("Place finger on sensor...", end="")
@@ -71,27 +83,29 @@ def enroll_finger(location):
             print("Other error")
         return False
 
-    print(f"Storing model #{location}...", end="")
+    print("Storing model #%d..." % location, end="")
     i = finger.store_model(location)
     if i == adafruit_fingerprint.OK:
         print("Stored")
-        return True
     else:
-        print("Failed to store")
+        if i == adafruit_fingerprint.BADLOCATION:
+            print("Bad storage location")
+        elif i == adafruit_fingerprint.FLASHERR:
+            print("Flash storage error")
+        else:
+            print("Other error")
         return False
 
-def delete_finger(location):
-    i = finger.delete_model(location)
-    return i == adafruit_fingerprint.OK
+    return True
 
-def search_finger():
-    print("Waiting for image...")
-    while finger.get_image() != adafruit_fingerprint.OK:
-        pass
-    print("Templating...")
-    if finger.image_2_tz(1) != adafruit_fingerprint.OK:
-        return None
-    print("Searching...")
-    if finger.finger_search() != adafruit_fingerprint.OK:
-        return None
-    return finger.finger_id, finger.confidence
+def delete_finger(location):
+    return finger.delete_model(location)
+
+def read_templates():
+    return finger.read_templates()
+
+def get_finger_id():
+    return finger.finger_id
+
+def get_confidence():
+    return finger.confidence

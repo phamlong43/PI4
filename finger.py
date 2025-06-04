@@ -31,40 +31,40 @@ def enroll_finger(location):
             print("Place finger on sensor...")
         else:
             print("Place same finger again...")
+        start_time = time.time()
         while True:
             i = finger.get_image()
             if i == adafruit_fingerprint.OK:
                 print("Image taken")
                 break
-            if i == adafruit_fingerprint.NOFINGER:
-                print(".", end="", flush=True)
+            elif i == adafruit_fingerprint.NOFINGER:
+                # Nếu quá 10s không có ngón tay đặt, báo lỗi
+                if time.time() - start_time > 10:
+                    return False, "Timeout: No finger detected"
             elif i == adafruit_fingerprint.IMAGEFAIL:
-                print("Imaging error")
-                return False
+                return False, "Imaging error"
             else:
-                print("Other error")
-                return False
+                return False, f"Error code: {i}"
         print("Templating...")
         i = finger.image_2_tz(fingerimg)
         if i != adafruit_fingerprint.OK:
-            print("Failed to template")
-            return False
+            return False, f"Failed to template (code {i})"
         if fingerimg < 3:
             print("Remove finger")
             time.sleep(1)
+            # Đợi tới khi ngón tay được rút ra
             while finger.get_image() != adafruit_fingerprint.NOFINGER:
                 pass
     print("Creating model...")
     i = finger.create_model()
     if i != adafruit_fingerprint.OK:
-        print("Failed to create model")
-        return False
+        return False, f"Failed to create model (code {i})"
     print(f"Storing model #{location}...")
     i = finger.store_model(location)
     if i != adafruit_fingerprint.OK:
-        print("Failed to store model")
-        return False
-    return True
+        return False, f"Failed to store model (code {i})"
+    return True, "Enrollment successful"
+
 
 def delete_finger(location):
     return finger.delete_model(location)

@@ -5,6 +5,7 @@ from python_speech_features import mfcc
 from sklearn.mixture import GaussianMixture
 import pickle
 import os
+import scipy.io.wavfile as wavfile # Đã đổi từ 'import wave' sang 'import scipy.io.wavfile as wavfile'
 
 # --- Cấu hình ---
 DINH_DANG = pyaudio.paInt16
@@ -39,6 +40,7 @@ def ghi_am_audio(ten_file, thoi_luong=THOI_GIAN_GHI_AM):
     stream.close()
     audio.terminate()
 
+    # Sử dụng module wave để ghi file WAV
     with wave.open(ten_file, 'wb') as wf:
         wf.setnchannels(KENH)
         wf.setsampwidth(audio.get_sample_size(DINH_DANG))
@@ -47,7 +49,8 @@ def ghi_am_audio(ten_file, thoi_luong=THOI_GIAN_GHI_AM):
 
 def trich_xuat_dac_trung_mfcc(duong_dan_audio):
     try:
-        (tan_so, tin_hieu) = wave.read(duong_dan_audio)
+        # Sửa lỗi ở đây: Sử dụng wavfile.read() từ scipy.io.wavfile
+        (tan_so, tin_hieu) = wavfile.read(duong_dan_audio)
         if tin_hieu.dtype.kind == 'i':
             tin_hieu = tin_hieu.astype(np.float32) / (2**15)
         
@@ -93,7 +96,6 @@ def xac_minh_nguoi_noi(ten_nguoi_noi, duong_dan_file_audio):
 
     diem_so = gmm_da_dang_ky.score(dac_trung_kiem_tra)
     
-    # Ngưỡng xác minh. Cần điều chỉnh thực nghiệm.
     NGUONG_XAC_MINH = -100 
 
     print(f"Điểm xác minh cho '{ten_nguoi_noi}': {diem_so:.2f}")

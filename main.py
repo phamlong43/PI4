@@ -5,39 +5,28 @@ import pickle
 import os
 import scipy.io.wavfile as wavfile 
 
-# Thêm thư viện SpeechBrain
 import torch
+import torchaudio
 from speechbrain.inference.speaker import EncoderClassifier
 
-# --- Cấu hình ---
 DINH_DANG = pyaudio.paInt16
 KENH = 1
-TAN_SO_LAY_MAU = 16000 # Hz (SpeechBrain models expect 16kHz)
+TAN_SO_LAY_MAU = 16000 
 KICH_THUOC_KHUNG = 1024
-THOI_GIAN_GHI_AM_LAN_DAU = 3 # Giây cho mỗi lần ghi âm khi đăng ký/xác minh (có thể ngắn hơn với DL)
-SO_LAN_GHI_AM_DANG_KY = 2 # Số lần người dùng nói khi đăng ký (có thể ít hơn so với GMM)
+THOI_GIAN_GHI_AM_LAN_DAU = 3 
+SO_LAN_GHI_AM_DANG_KY = 2 
 
-THU_MUC_NGUOI_DUNG = "enrolled_speakers_ai" # Thay đổi thư mục để tránh trùng với GMM
+THU_MUC_NGUOI_DUNG = "enrolled_speakers_ai" 
 TEN_FILE_GHI_AM_TAM = "temp_recording_ai.wav" 
 
-# Ngưỡng xác minh cho mô hình AI.
-# Giá trị này sẽ rất khác so với GMM (thường là độ tương đồng cosine, gần 1 là giống nhau)
-# Cần điều chỉnh thực nghiệm. Thường là từ 0.7 đến 0.9.
-NGUONG_XAC_MINH_CO_DINH = 0.75 # Ví dụ ngưỡng cho cosine similarity
+NGUONG_XAC_MINH_CO_DINH = 0.75 
 
-# --- Khởi tạo mô hình AI (SpeechBrain) ---
-# Tải mô hình ECAPA-TDNN đã được huấn luyện sẵn
 try:
     classifier = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb", 
-                                                run_opts={"device":"cpu"}) # Force CPU for Raspberry Pi
-    print("Đã tải mô hình AI ECAPA-TDNN thành công.")
+                                                run_opts={"device":"cpu"}) 
 except Exception as e:
     print(f"Lỗi khi tải mô hình SpeechBrain: {e}")
-    print("Vui lòng đảm bảo bạn có kết nối Internet và các thư viện cần thiết.")
-    print("Nếu lỗi liên quan đến device, hãy kiểm tra lại cài đặt PyTorch của bạn.")
-    classifier = None # Đặt classifier là None nếu không tải được
-
-# --- Hàm hỗ trợ ---
+    classifier = None 
 
 def ghi_am_audio(ten_file, thoi_luong=THOI_GIAN_GHI_AM_LAN_DAU):
     audio = pyaudio.PyAudio()
@@ -51,7 +40,7 @@ def ghi_am_audio(ten_file, thoi_luong=THOI_GIAN_GHI_AM_LAN_DAU):
     print(f"Đang ghi âm {thoi_luong} giây âm thanh cho '{ten_file}'...")
     frames = []
 
-    for i in range(0, int(TAN_SO_LAY_MAU / KICH_THUOC_KHUNG * thoi_luong)): # Đã sửa lỗi đánh máy TAN_SO_LAY_MAU
+    for i in range(0, int(TAN_SO_LAY_MAU / KICH_THUOC_KHUNG * thoi_luong)):
         data = stream.read(KICH_THUOC_KHUNG)
         frames.append(data)
 
@@ -68,19 +57,20 @@ def ghi_am_audio(ten_file, thoi_luong=THOI_GIAN_GHI_AM_LAN_DAU):
         wf.writeframes(b''.join(frames))
 
 def trich_xuat_embedding_ai(audio_path):
-    """Trích xuất embedding giọng nói bằng mô hình AI SpeechBrain."""
     if classifier is None:
         print("Mô hình AI chưa được tải. Không thể trích xuất embedding.")
         return None
     try:
-        # Load the audio file and get the embedding
-        # SpeechBrain expects 16kHz audio, check if your recording matches
-        # If not, you might need to resample the audio first (e.g., using torchaudio.transforms.Resample)
+        signal, sr = torchaudio.load(audio_path)
         
-        # This will load, resample (if needed) and normalize
-        signal = classifier.audio_pipeline.convert_audio(audio_path) 
-        # Get the embedding (vector) for the speaker
-        embedding = classifier.encode_batch(signal).cpu().numpy().squeeze()
+        if sr != TAN_SO_LAY_MAU:
+            resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=TAN_SO_LAY_MAU)
+            signal = resampler(signal)
+
+        if signal.shape[0] > 1:
+            signal = torch.mean(signal, dim=0, keepdim=True)
+
+        embedding = classifier.encode_batch(signal.squeeze(0).unsqueeze(0)).cpu().numpy().squeeze()
         return embedding
     except Exception as e:
         print(f"Lỗi khi trích xuất embedding từ {audio_path}: {e}")
@@ -113,10 +103,9 @@ def huan_luyen_mo_hinh_nguoi_noi_ai_da_lan(ten_nguoi_noi, so_lan_ghi_am=SO_LAN_G
         print(f"Không có đủ embeddings để tạo mẫu giọng nói cho {ten_nguoi_noi}.")
         return False
 
-    # Tính toán vector trung bình (mean embedding) làm mẫu cho người nói
     speaker_template = np.mean(tat_ca_embeddings, axis=0)
     
-    duong_dan_mau = os.path.join(THU_MUC_NGUOI_DUNG, f"{ten_nguoi_noi}.pkl") # Lưu dưới dạng pickle
+    duong_dan_mau = os.path.join(THU_MUC_NGUOI_DUNG, f"{ten_nguoi_noi}.pkl") 
     with open(duong_dan_mau, 'wb') as f:
         pickle.dump(speaker_template, f)
     print(f"Mẫu giọng nói AI cho '{ten_nguoi_noi}' đã được huấn luyện và lưu vào {duong_dan_mau}")
@@ -148,24 +137,15 @@ def xac_minh_nguoi_noi_ai(ten_nguoi_noi, nguong_xac_minh):
     if os.path.exists(duong_dan_audio_xac_minh):
         os.remove(duong_dan_audio_xac_minh)
 
-    # Tính toán độ tương đồng Cosine (Cosine Similarity)
-    # Cosine Similarity = (A . B) / (||A|| * ||B||)
-    # Giá trị từ -1 (hoàn toàn khác biệt) đến 1 (hoàn toàn giống nhau)
     do_tuong_dong = np.dot(mau_da_dang_ky, embedding_kiem_tra) / (np.linalg.norm(mau_da_dang_ky) * np.linalg.norm(embedding_kiem_tra))
-
-    # Chuyển độ tương đồng thành tỷ lệ phần trăm trực quan
-    # Nếu ngưỡng là 0.75, và độ tương đồng là 0.85, thì rất phù hợp.
-    # Nếu độ tương đồng là 0.60, thì không phù hợp.
     
-    # Công thức ước lượng % phù hợp, làm cho dễ hiểu
-    if do_tuong_dong >= 1.0: # Hoàn hảo
+    if do_tuong_dong >= 1.0: 
         ty_le_phu_hop = 100.0
-    elif do_tuong_dong >= nguong_xac_minh: # Trong khoảng chấp nhận
+    elif do_tuong_dong >= nguong_xac_minh: 
         ty_le_phu_hop = 75 + (do_tuong_dong - nguong_xac_minh) / (1.0 - nguong_xac_minh) * 25
-    else: # Dưới ngưỡng
-        # Scale từ -1 đến ngưỡng thành 0-75%
+    else: 
         ty_le_phu_hop = (do_tuong_dong - (-1.0)) / (nguong_xac_minh - (-1.0)) * 75
-        ty_le_phu_hop = max(0.0, min(75.0, ty_le_phu_hop)) # Đảm bảo nằm trong khoảng [0, 75]
+        ty_le_phu_hop = max(0.0, min(75.0, ty_le_phu_hop)) 
 
     print(f"Độ tương đồng (Cosine Similarity): {do_tuong_dong:.4f} (Ngưỡng: {nguong_xac_minh:.4f})")
     
@@ -176,12 +156,10 @@ def xac_minh_nguoi_noi_ai(ten_nguoi_noi, nguong_xac_minh):
         print(f"Kết quả: **XÁC MINH THẤT BẠI.** Tỷ lệ phù hợp: {ty_le_phu_hop:.2f}%")
         return False, ty_le_phu_hop
 
-# --- Logic chính ---
-
 if __name__ == "__main__":
     if classifier is None:
         print("Không thể chạy ứng dụng do mô hình AI không được tải.")
-        exit() # Thoát nếu mô hình không tải được
+        exit()
 
     os.makedirs(THU_MUC_NGUOI_DUNG, exist_ok=True)
     os.makedirs(os.path.join(THU_MUC_NGUOI_DUNG, "enroll_audios"), exist_ok=True) 
@@ -211,7 +189,7 @@ if __name__ == "__main__":
                 print("Tên người nói không được để trống.")
                 continue
 
-            xac_minh_nguoi_noi_ai(ten_nguoi_noi_can_xac_minh, NGUONG_XAC_MINH_CO_DINH)
+            thanh_cong, ty_le = xac_minh_nguoi_noi_ai(ten_nguoi_noi_can_xac_minh, NGUONG_XAC_MINH_CO_DINH)
             
         elif lua_chon == '3':
             print("Đang thoát chương trình.")

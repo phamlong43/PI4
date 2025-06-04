@@ -40,8 +40,7 @@ class FingerprintGUI:
         if name in self.db.values():
             self.log_insert(f"Name '{name}' already exists.")
             return
-
-        # Kiểm tra có chỗ trống id nào không (1..127)
+    
         used_ids = set(map(int, self.db.keys()))
         for i in range(1, 128):
             if i not in used_ids:
@@ -50,26 +49,24 @@ class FingerprintGUI:
         else:
             self.log_insert("No free ID slot available.")
             return
-
+    
         self.log_insert(f"Register fingerprint for {name} at ID {free_id}")
-
-        # Kiểm tra vân tay đã tồn tại chưa
+    
         self.log_insert("Please place your finger to check if fingerprint exists...")
         fid = fapp.search_finger()
         if fid is not None:
             existing_name = self.db.get(str(fid), None)
             self.log_insert(f"Fingerprint already exists for '{existing_name}'. Registration aborted.")
             return
-
-        # Enroll mới
+    
         self.log_insert("Place finger 3 times to register.")
-        success = fapp.enroll_finger(free_id)
+        success, msg = fapp.enroll_finger(free_id)
         if success:
             self.db[str(free_id)] = name
             fapp.save_db(self.db)
             self.log_insert(f"User '{name}' registered successfully with ID {free_id}.")
         else:
-            self.log_insert("Failed to enroll fingerprint.")
+            self.log_insert(f"Enrollment failed: {msg}")
 
     def edit_user(self):
         name = self.name_entry.get().strip()

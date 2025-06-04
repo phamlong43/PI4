@@ -1,6 +1,6 @@
 import tkinter as tk
-from tkinter import ttk
-import fingerprints as fp
+from tkinter import ttk, simpledialog, messagebox
+import fingerprint_functions as fp
 
 class FingerprintApp:
     def __init__(self, root):
@@ -44,7 +44,7 @@ class FingerprintApp:
     def get_name(self):
         name = self.name_entry.get().strip()
         if not name:
-            self.status_label.config(text="Lỗi: Vui lòng nhập tên", foreground="red")
+            messagebox.showerror("Lỗi", "Vui lòng nhập tên")
             return None
         return name
 
@@ -55,7 +55,6 @@ class FingerprintApp:
         self.status_label.config(text="Đang đăng ký vân tay...", foreground="blue")
         self.root.update()
 
-        # Tự động cấp ID mới, giả sử hàm enroll_finger trả về True nếu thành công
         success = fp.enroll_finger_auto(name)
         if success:
             self.status_label.config(text=f"Đăng ký thành công cho {name}", foreground="green")
@@ -68,8 +67,7 @@ class FingerprintApp:
         old_name = self.get_name()
         if old_name is None:
             return
-        # Yêu cầu nhập tên mới trong 1 popup
-        new_name = tk.simpledialog.askstring("Sửa tên", "Nhập tên mới:")
+        new_name = simpledialog.askstring("Sửa tên", "Nhập tên mới:")
         if not new_name:
             self.status_label.config(text="Hủy sửa tên", foreground="orange")
             return
@@ -78,15 +76,15 @@ class FingerprintApp:
             self.status_label.config(text=f"Đã đổi tên {old_name} thành {new_name}", foreground="green")
             self.log(f"Đổi tên {old_name} → {new_name}")
         else:
-            self.status_label.config(text=f"Không tìm thấy tên {old_name}", foreground="red")
-            self.log(f"Lỗi: Không tìm thấy tên {old_name}")
+            self.status_label.config(text=f"Không tìm thấy tên {old_name} hoặc tên mới đã tồn tại", foreground="red")
+            self.log(f"Lỗi khi đổi tên {old_name}")
 
     def delete(self):
         name = self.get_name()
         if name is None:
             return
-        confirm = tk.simpledialog.askstring("Xác nhận xóa", f"Nhập 'YES' để xóa vân tay của {name}:")
-        if confirm != "YES":
+        confirm = messagebox.askyesno("Xác nhận xóa", f"Bạn có chắc muốn xóa vân tay của {name}?")
+        if not confirm:
             self.status_label.config(text="Hủy xóa", foreground="orange")
             return
         success = fp.delete_finger_by_name(name)

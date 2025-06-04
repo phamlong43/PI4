@@ -51,6 +51,7 @@ def pose_inference(input_queue, output_queue):
     ) as pose:
         print("Pose Inference Process: Bắt đầu.")
         frame_count = 0 
+        last_valid_pose_landmarks = None 
         
         while True:
             frame = input_queue.get()
@@ -71,13 +72,16 @@ def pose_inference(input_queue, output_queue):
                 image.flags.writeable = True
 
                 if results.pose_landmarks:
-                    mp_drawing.draw_landmarks(
-                        annotated_frame_to_send, 
-                        results.pose_landmarks,
-                        mp_pose.POSE_CONNECTIONS,
-                        mp_drawing.DrawingSpec(color=(0,255,0), thickness=2, circle_radius=2),
-                        mp_drawing.DrawingSpec(color=(0,0,255), thickness=2)
-                    )
+                    last_valid_pose_landmarks = results.pose_landmarks
+            
+            if last_valid_pose_landmarks:
+                mp_drawing.draw_landmarks(
+                    annotated_frame_to_send, 
+                    last_valid_pose_landmarks, 
+                    mp_pose.POSE_CONNECTIONS,
+                    mp_drawing.DrawingSpec(color=(0,255,0), thickness=2, circle_radius=2),
+                    mp_drawing.DrawingSpec(color=(0,0,255), thickness=2)
+                )
             
             annotated_frame_to_send = cv2.flip(annotated_frame_to_send, 1)
 

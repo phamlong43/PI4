@@ -11,6 +11,8 @@ POSE_MODEL_COMPLEXITY = 0
 POSE_MIN_DETECTION_CONFIDENCE = 0.7 
 POSE_MIN_TRACKING_CONFIDENCE = 0.7 
 
+NO_POSE_FRAMES_THRESHOLD = 10 
+
 def capture_frame(queue):
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -52,6 +54,7 @@ def pose_inference(input_queue, output_queue):
         print("Pose Inference Process: Bắt đầu.")
         frame_count = 0 
         last_valid_pose_landmarks = None 
+        no_pose_detected_count = 0 
         
         while True:
             frame = input_queue.get()
@@ -73,72 +76,11 @@ def pose_inference(input_queue, output_queue):
 
                 if results.pose_landmarks:
                     last_valid_pose_landmarks = results.pose_landmarks
+                    no_pose_detected_count = 0 
+                else:
+                    no_pose_detected_count += 1 
+            
+            if no_pose_detected_count >= NO_POSE_FRAMES_THRESHOLD:
+                last_valid_pose_landmarks = None 
             
             if last_valid_pose_landmarks:
-                mp_drawing.draw_landmarks(
-                    annotated_frame_to_send, 
-                    last_valid_pose_landmarks, 
-                    mp_pose.POSE_CONNECTIONS,
-                    mp_drawing.DrawingSpec(color=(0,255,0), thickness=2, circle_radius=2),
-                    mp_drawing.DrawingSpec(color=(0,0,255), thickness=2)
-                )
-            
-            annotated_frame_to_send = cv2.flip(annotated_frame_to_send, 1)
-
-            if output_queue.full():
-                try:
-                    output_queue.get_nowait()
-                except Exception:
-                    pass
-
-            output_queue.put(annotated_frame_to_send)
-
-    print("Pose Inference Process: Đã thoát.")
-
-def display_frame(queue):
-    print("Display Process: Bắt đầu.")
-    while True:
-        try:
-            frame = queue.get(timeout=1)
-        except Exception:
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-            continue
-
-        if frame is None:
-            print("Display Process: Nhận tín hiệu thoát, thoát.")
-            break
-
-        cv2.imshow('Pose Estimation', frame)
-        
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-            
-    cv2.destroyAllWindows()
-    print("Display Process: Đã thoát.")
-
-if __name__ == '__main__':
-    print("Chương trình chính: Khởi tạo Queues và Processes.")
-    input_q = Queue(maxsize=QUEUE_MAX_SIZE)
-    output_q = Queue(maxsize=QUEUE_MAX_SIZE)
-
-    p_capture = Process(target=capture_frame, args=(input_q,))
-    p_infer = Process(target=pose_inference, args=(input_q, output_q))
-    p_display = Process(target=display_frame, args=(output_q,))
-
-    p_capture.start()
-    p_infer.start()
-    p_display.start()
-
-    print("Chương trình chính: Đang chạy các tiến trình. Nhấn 'q' để thoát.")
-    
-    p_display.join()
-
-    print("Chương trình chính: Phát hiện Display Process đã thoát. Đang gửi tín hiệu dừng tới các tiến trình khác.")
-    input_q.put(None)
-    output_q.put(None)
-    
-    p_infer.join()
-    p_capture.join()
-
-    print("Chương trình chính: Tất cả các tiến trình đã thoát. Chương trình kết thúc.")

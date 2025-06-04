@@ -1,118 +1,139 @@
-# fingerprint_app.py
+import tkinter as tk
+from tkinter import messagebox, scrolledtext
+import fingerprint_app as fapp
+import adafruit_fingerprint
 
-import json
-import os
-from fingerprint import (
-    finger,
-    get_fingerprint,
-    enroll_finger,
-    delete_finger,
-    read_templates,
-    get_finger_id,
-    get_confidence
-)
+class FingerprintGUI:
+    def __init__(self, master):
+        self.master = master
+        self.master.title("Fingerprint Auth System")
 
-USER_FILE = "users.json"
+        self.db = fapp.load_db()
 
-def load_users():
-    if not os.path.exists(USER_FILE):
-        return {}
-    with open(USER_FILE, "r") as f:
-        return json.load(f)
+        # Label và Entry nhập tên
+        tk.Label(master, text="Name:").grid(row=0, column=0)
+        self.name_entry = tk.Entry(master)
+        self.name_entry.grid(row=0, column=1)
 
-def save_users(users):
-    with open(USER_FILE, "w") as f:
-        json.dump(users, f)
+        # Nút chức năng
+        tk.Button(master, text="Add", command=self.add_user).grid(row=1, column=0)
+        tk.Button(master, text="Edit", command=self.edit_user).grid(row=1, column=1)
+        tk.Button(master, text="Delete", command=self.delete_user).grid(row=1, column=2)
+        tk.Button(master, text="Authenticate", command=self.authenticate_user).grid(row=1, column=3)
 
-def get_num():
-    """Use input() to get a valid number from 1 to 127. Retry till success!"""
-    i = 0
-    while (i > 127) or (i < 1):
-        try:
-            i = int(input("Enter ID # from 1-127: "))
-        except ValueError:
-            pass
-    return i
+        # Vùng log hiển thị trạng thái
+        self.log = scrolledtext.ScrolledText(master, width=60, height=20)
+        self.log.grid(row=2, column=0, columnspan=4)
 
-def enroll_or_update_finger():
-    location = get_num()
-    users = load_users()
-    
-    if str(location) in users:
-        print(f"User ID {location} already exists with name: {users[str(location)]}")
-        update = input("Do you want to update fingerprint and/or name? (y/n): ")
-        if update.lower() != 'y':
-            print("Cancelled.")
+        self.log_insert("System initialized.")
+
+    def log_insert(self, text):
+        self.log.insert(tk.END, text + "\n")
+        self.log.see(tk.END)
+        self.master.update()
+
+    def add_user(self):
+        name = self.name_entry.get().strip()
+        if not name:
+            messagebox.showerror("Error", "Name cannot be empty")
+            return
+        if name in self.db.values():
+            self.log_insert(f"Name '{name}' already exists.")
             return
 
-    # Tiến hành enroll như bình thường
-    if enroll_finger(location):
-        # Sau enroll thành công, nhập tên mới
-        new_name = input("Enter name for user ID {}: ".format(location))
-        users[str(location)] = new_name
-        save_users(users)
-        print("Fingerprint and name stored successfully.")
-    else:
-        print("Failed to enroll fingerprint.")
+        # Kiểm tra có chỗ trống id nào không (1..127)
+        used_ids = set(map(int, self.db.keys()))
+        for i in range(1, 128):
+            if i not in used_ids:
+                free_id = i
+                break
+        else:
+            self.log_insert("No free ID slot available.")
+            return
 
-def edit_name():
-    users = load_users()
-    user_id = get_num()
-    if str(user_id) not in users:
-        print("User ID not found.")
-        return
-    new_name = input("Enter new name for user ID {}: ".format(user_id))
-    users[str(user_id)] = new_name
-    save_users(users)
-    print(f"Name updated for ID {user_id} -> {new_name}")
+        self.log_insert(f"Register fingerprint for {name} at ID {free_id}")
 
-def delete_finger_and_name():
-    user_id = get_num()
-    if delete_finger(user_id) == finger.OK:
-        users = load_users()
-        user_id_str = str(user_id)
-        if user_id_str in users:
-            users.pop(user_id_str)
-            save_users(users)
-        print("Deleted fingerprint and user name for ID:", user_id)
-    else:
-        print("Failed to delete fingerprint.")
+        # Kiểm tra vân tay đã tồn tại chưa
+        self.log_insert("Please place your finger to check if fingerprint exists...")
+        fid = fapp.search_finger()
+        if fid is not None:
+            existing_name = self.db.get(str(fid), None)
+            self.log_insert(f"Fingerprint already exists for '{existing_name}'. Registration aborted.")
+            return
 
-def find_finger():
-    if get_fingerprint():
-        users = load_users()
-        user_name = users.get(str(get_finger_id()), "Unknown User")
-        print(f"Detected user: {user_name} (ID: {get_finger_id()}) with confidence {get_confidence()}")
-    else:
-        print("Finger not found")
+        # Enroll mới
+        self.log_insert("Place finger 3 times to register.")
+        success = fapp.enroll_finger(free_id)
+        if success:
+            self.db[str(free_id)] = name
+            fapp.save_db(self.db)
+            self.log_insert(f"User '{name}' registered successfully with ID {free_id}.")
+        else:
+            self.log_insert("Failed to enroll fingerprint.")
+
+    def edit_user(self):
+        name = self.name_entry.get().strip()
+        if not name:
+            messagebox.showerror("Error", "Name cannot be empty")
+            return
+        # Tìm ID theo tên
+        found_id = None
+        for k, v in self.db.items():
+            if v == name:
+                found_id = int(k)
+                break
+        if not found_id:
+            self.log_insert(f"User '{name}' not found.")
+            return
+        self.log_insert(f"Editing fingerprint for '{name}' with ID {found_id}")
+        # Xóa mẫu cũ
+        if fapp.delete_finger(found_id) != adafruit_fingerprint.OK:
+            self.log_insert("Failed to delete old fingerprint template.")
+            return
+        # Enroll lại
+        self.log_insert("Place finger 3 times to re-register.")
+        success = fapp.enroll_finger(found_id)
+        if success:
+            self.log_insert(f"Fingerprint for '{name}' updated successfully.")
+        else:
+            self.log_insert("Failed to update fingerprint.")
+
+    def delete_user(self):
+        name = self.name_entry.get().strip()
+        if not name:
+            messagebox.showerror("Error", "Name cannot be empty")
+            return
+        found_id = None
+        for k, v in self.db.items():
+            if v == name:
+                found_id = int(k)
+                break
+        if not found_id:
+            self.log_insert(f"User '{name}' not found.")
+            return
+        if fapp.delete_finger(found_id) == adafruit_fingerprint.OK:
+            del self.db[str(found_id)]
+            fapp.save_db(self.db)
+            self.log_insert(f"User '{name}' deleted successfully.")
+        else:
+            self.log_insert("Failed to delete fingerprint template.")
+
+    def authenticate_user(self):
+        self.log_insert("Please place your finger to authenticate...")
+        fid = fapp.search_finger()
+        if fid is None:
+            self.log_insert("Fingerprint not recognized.")
+            return
+        name = self.db.get(str(fid), None)
+        if name:
+            self.log_insert(f"Authenticated: {name}")
+        else:
+            self.log_insert(f"Fingerprint ID {fid} found but no associated name.")
 
 def main():
-    while True:
-        if read_templates() != finger.OK:
-            raise RuntimeError("Failed to read templates")
-        print("----------------")
-        print("Fingerprint templates:", finger.templates)
-        print("e) enroll or update fingerprint")
-        print("f) find fingerprint")
-        print("d) delete fingerprint")
-        print("n) edit user name")
-        print("q) quit")
-        print("----------------")
-        c = input("> ")
-
-        if c == "e":
-            enroll_or_update_finger()
-        elif c == "f":
-            find_finger()
-        elif c == "d":
-            delete_finger_and_name()
-        elif c == "n":
-            edit_name()
-        elif c == "q":
-            print("Exiting.")
-            break
-        else:
-            print("Invalid choice.")
+    root = tk.Tk()
+    app = FingerprintGUI(root)
+    root.mainloop()
 
 if __name__ == "__main__":
     main()

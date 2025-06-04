@@ -70,13 +70,30 @@ def delete_finger(location):
     return finger.delete_model(location)
 
 def search_finger():
-    i = finger.get_image()
-    if i != adafruit_fingerprint.OK:
-        return None
+    print("Waiting for finger...")
+    while True:
+        i = finger.get_image()
+        if i == adafruit_fingerprint.OK:
+            break
+        elif i == adafruit_fingerprint.NOFINGER:
+            # chưa có ngón tay, tiếp tục chờ
+            continue
+        else:
+            print(f"Error getting image: code {i}")
+            return None, None
+
     i = finger.image_2_tz(1)
     if i != adafruit_fingerprint.OK:
-        return None
+        print(f"Error templating image: code {i}")
+        return None, None
+
     i = finger.finger_fast_search()
     if i == adafruit_fingerprint.OK:
-        return finger.finger_id
-    return None
+        return finger.finger_id, finger.confidence
+    elif i == adafruit_fingerprint.NOTFOUND:
+        print("No matching fingerprint found.")
+        return None, None
+    else:
+        print(f"Error searching fingerprint: code {i}")
+        return None, None
+

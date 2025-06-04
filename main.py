@@ -5,7 +5,7 @@ import time
 
 FRAME_WIDTH = 320
 FRAME_HEIGHT = 240
-QUEUE_MAX_SIZE = 2 # Giữ ở mức 2 để cân bằng giữa độ trễ và tránh mất khung hình
+QUEUE_MAX_SIZE = 2 
 
 POSE_MODEL_COMPLEXITY = 0
 POSE_MIN_DETECTION_CONFIDENCE = 0.7 
@@ -50,18 +50,18 @@ def pose_inference(input_queue, output_queue):
         min_tracking_confidence=POSE_MIN_TRACKING_CONFIDENCE
     ) as pose:
         print("Pose Inference Process: Bắt đầu.")
-        frame_count = 0 # Biến đếm khung hình để bỏ qua
-        last_processed_frame = None # Lưu trữ khung hình cuối cùng đã xử lý thành công
-
+        frame_count = 0 
+        
         while True:
             frame = input_queue.get()
             if frame is None:
                 print("Pose Inference Process: Nhận tín hiệu thoát, thoát.")
                 break
 
+            annotated_frame_to_send = frame.copy() 
+            
             frame_count += 1
             
-            # Chỉ xử lý 1 lần sau mỗi 3 khung hình mới (1/3 tốc độ)
             if frame_count % 3 == 0: 
                 image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 image.flags.writeable = False
@@ -70,50 +70,24 @@ def pose_inference(input_queue, output_queue):
                 
                 image.flags.writeable = True
 
-                annotated_frame = frame.copy()
-
                 if results.pose_landmarks:
                     mp_drawing.draw_landmarks(
-                        annotated_frame,
+                        annotated_frame_to_send, 
                         results.pose_landmarks,
                         mp_pose.POSE_CONNECTIONS,
                         mp_drawing.DrawingSpec(color=(0,255,0), thickness=2, circle_radius=2),
                         mp_drawing.DrawingSpec(color=(0,0,255), thickness=2)
                     )
-                    # Nếu có kết quả, lưu lại khung hình đã xử lý
-                    last_processed_frame = annotated_frame
-                else:
-                    # Nếu không có kết quả, vẫn cố gắng hiển thị khung hình cuối cùng có kết quả
-                    if last_processed_frame is not None:
-                        annotated_frame = last_processed_frame.copy()
-                    else:
-                        annotated_frame = frame.copy() # Nếu chưa có frame nào được xử lý
+            
+            annotated_frame_to_send = cv2.flip(annotated_frame_to_send, 1)
 
-                if output_queue.full():
-                    try:
-                        output_queue.get_nowait()
-                    except Exception:
-                        pass
+            if output_queue.full():
+                try:
+                    output_queue.get_nowait()
+                except Exception:
+                    pass
 
-                output_queue.put(annotated_frame)
-            else:
-                # Nếu khung hình không được xử lý, gửi khung hình đã xử lý gần nhất
-                # hoặc khung hình gốc nếu chưa có khung hình nào được xử lý
-                if last_processed_frame is not None:
-                    if output_queue.full():
-                        try:
-                            output_queue.get_nowait()
-                        except Exception:
-                            pass
-                    output_queue.put(last_processed_frame.copy())
-                else:
-                    # Gửi bản sao của khung hình gốc để giữ cho luồng hiển thị không bị ngắt quãng
-                    if output_queue.full():
-                        try:
-                            output_queue.get_nowait()
-                        except Exception:
-                            pass
-                    output_queue.put(frame.copy())
+            output_queue.put(annotated_frame_to_send)
 
     print("Pose Inference Process: Đã thoát.")
 

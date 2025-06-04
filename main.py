@@ -1,10 +1,9 @@
 import tkinter as tk
 from tkinter import messagebox
 import json
-from fingerprint import enroll_finger, get_fingerprint
-import adafruit_fingerprint
+from fingerprint import enroll_finger, get_fingerprint, finger
 
-# Đọc danh sách người dùng
+# Quản lý file user (tên <-> id vân tay)
 def load_users():
     try:
         with open("users.json", "r") as f:
@@ -16,43 +15,57 @@ def save_users(users):
     with open("users.json", "w") as f:
         json.dump(users, f)
 
-users = load_users()
+users = load_users()  # {"Tên người dùng": id mẫu vân tay}
+
+def find_free_id():
+    used_ids = list(users.values())
+    for i in range(1, 128):
+        if i not in used_ids:
+            return i
+    return None
 
 def enroll():
     name = entry_name.get().strip()
     if not name:
         messagebox.showerror("Lỗi", "Vui lòng nhập tên")
         return
-    # Tìm ID trống
-    used_ids = list(map(int, users.keys()))
-    next_id = 1
-    while next_id in used_ids:
-        next_id += 1
-    if enroll_finger(next_id):
-        users[str(next_id)] = name
+
+    if name in users:
+        messagebox.showwarning("Cảnh báo", f"Tên '{name}' đã tồn tại!")
+        return
+
+    new_id = find_free_id()
+    if new_id is None:
+        messagebox.showerror("Lỗi", "Bộ nhớ vân tay đã đầy!")
+        return
+
+    if enroll_finger(new_id):
+        users[name] = new_id
         save_users(users)
-        messagebox.showinfo("Thành công", f"Đã lưu '{name}' với ID {next_id}")
+        messagebox.showinfo("Thành công", f"Đã lưu vân tay cho {name}")
+        entry_name.delete(0, tk.END)
     else:
-        messagebox.showerror("Thất bại", "Không thể đăng ký")
+        messagebox.showerror("Thất bại", "Không thể đăng ký vân tay")
 
 def verify():
     if get_fingerprint():
-        user_id = str(finger.finger_id)
-        name = users.get(user_id, "Không xác định")
-        confidence = finger.confidence
-        messagebox.showinfo("Xác thực", f"Đã nhận diện: {name} (ID {user_id})\nĐộ tin cậy: {confidence}")
+        uid = finger.finger_id
+        name = next((k for k, v in users.items() if v == uid), None)
+        if not name:
+            name = "Không xác định"
+        conf = finger.confidence
+        messagebox.showinfo("Xác thực", f"Đã nhận diện: {name}\nĐộ tin cậy: {conf}")
     else:
         messagebox.showwarning("Thất bại", "Không tìm thấy vân tay")
 
-# Giao diện
 root = tk.Tk()
 root.title("Hệ thống Vân tay")
 
-tk.Label(root, text="Tên người dùng:").pack()
-entry_name = tk.Entry(root)
+tk.Label(root, text="Nhập tên người dùng:").pack(pady=5)
+entry_name = tk.Entry(root, width=30)
 entry_name.pack()
 
-tk.Button(root, text="Đăng ký vân tay", command=enroll).pack(pady=5)
-tk.Button(root, text="Xác thực vân tay", command=verify).pack(pady=5)
+tk.Button(root, text="Đăng ký vân tay", command=enroll, width=25).pack(pady=10)
+tk.Button(root, text="Xác thực vân tay", command=verify, width=25).pack()
 
 root.mainloop()

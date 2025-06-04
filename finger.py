@@ -1,125 +1,87 @@
+# fingerprint_functions.py
 import json
-import time
-import serial
-import adafruit_fingerprint
+import os
 
-USER_DB_FILE = "user_db.json"
+DATA_FILE = "fingerprint_data.json"
 
-# Khởi tạo module vân tay
-uart = serial.Serial("/dev/ttyS0", baudrate=57600, timeout=1)
-finger = adafruit_fingerprint.Adafruit_Fingerprint(uart)
-
-def load_user_db():
-    try:
-        with open(USER_DB_FILE, "r") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+def load_data():
+    if not os.path.exists(DATA_FILE):
         return {}
+    with open(DATA_FILE, "r") as f:
+        return json.load(f)
 
-def save_user_db(user_db):
-    with open(USER_DB_FILE, "w") as f:
-        json.dump(user_db, f, indent=4)
+def save_data(data):
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
-def enroll_finger(location, username):
-    """Đăng ký vân tay tại vị trí location và lưu tên"""
-    print(f"Đăng ký vân tay cho {username} tại ID {location}")
-    for fingerimg in range(1, 3):
-        if fingerimg == 1:
-            print("Đặt ngón tay lên cảm biến...")
-        else:
-            print("Đặt lại cùng ngón tay...")
+def enroll_finger_auto(name):
+    """
+    Thêm vân tay với tên, tự cấp ID (int tăng dần).
+    Trả về True nếu thành công, False nếu tên đã tồn tại.
+    """
+    data = load_data()
+    # Kiểm tra trùng tên
+    for id_, info in data.items():
+        if info['name'] == name:
+            return False  # Tên đã tồn tại
 
-        while True:
-            i = finger.get_image()
-            if i == adafruit_fingerprint.OK:
-                print("Đã chụp ảnh")
-                break
-            elif i == adafruit_fingerprint.NOFINGER:
-                pass
-            else:
-                print(f"Lỗi khi lấy ảnh: {i}")
-                return False
+    # Tự cấp ID
+    if data:
+        new_id = str(int(max(data.keys(), key=int)) + 1)
+    else:
+        new_id = "1"
 
-        i = finger.image_2_tz(fingerimg)
-        if i != adafruit_fingerprint.OK:
-            print(f"Lỗi khi tạo mẫu ảnh: {i}")
-            return False
+    # TODO: Thêm code gọi phần cứng để enroll vân tay ở đây
+    # Giả sử enroll thành công:
 
-        if fingerimg == 1:
-            print("Bỏ tay ra cảm biến")
-            time.sleep(1)
-            while finger.get_image() != adafruit_fingerprint.NOFINGER:
-                pass
-
-    i = finger.create_model()
-    if i != adafruit_fingerprint.OK:
-        print(f"Lỗi khi tạo model: {i}")
-        return False
-
-    i = finger.store_model(location)
-    if i != adafruit_fingerprint.OK:
-        print(f"Lỗi khi lưu model: {i}")
-        return False
-
-    # Lưu tên người dùng
-    user_db = load_user_db()
-    user_db[str(location)] = username
-    save_user_db(user_db)
-    print(f"Đăng ký vân tay thành công cho {username}")
+    data[new_id] = {"name": name}
+    save_data(data)
     return True
 
-def delete_finger(location):
-    """Xóa mẫu vân tay theo location"""
-    i = finger.delete_model(location)
-    if i == adafruit_fingerprint.OK:
-        user_db = load_user_db()
-        if str(location) in user_db:
-            del user_db[str(location)]
-            save_user_db(user_db)
-        print(f"Xóa mẫu vân tay ID {location} thành công")
-        return True
-    else:
-        print(f"Xóa mẫu vân tay thất bại: {i}")
-        return False
+def update_username_by_name(old_name, new_name):
+    """
+    Sửa tên theo tên cũ.
+    Trả về True nếu thành công, False nếu không tìm thấy hoặc tên mới đã tồn tại.
+    """
+    data = load_data()
 
-def update_username(location, new_username):
-    """Cập nhật tên người dùng"""
-    user_db = load_user_db()
-    if str(location) in user_db:
-        user_db[str(location)] = new_username
-        save_user_db(user_db)
-        print(f"Cập nhật tên ID {location} thành công")
-        return True
-    else:
-        print(f"Không tìm thấy ID {location} để cập nhật")
-        return False
+    # Kiểm tra tên mới có trùng không
+    for info in data.values():
+        if info['name'] == new_name:
+            return False  # Tên mới đã tồn tại
+
+    for id_, info in data.items():
+        if info['name'] == old_name:
+            data[id_]['name'] = new_name
+            save_data(data)
+            return True
+    return False
+
+def delete_finger_by_name(name):
+    """
+    Xóa vân tay theo tên.
+    Trả về True nếu thành công, False nếu không tìm thấy.
+    """
+    data = load_data()
+    for id_, info in list(data.items()):
+        if info['name'] == name:
+            # TODO: Xóa vân tay phần cứng nếu cần
+            del data[id_]
+            save_data(data)
+            return True
+    return False
 
 def authenticate_finger():
-    """Xác thực vân tay và trả về (True, tên người) hoặc (False, None)"""
-    print("Đặt ngón tay lên cảm biến...")
-    while True:
-        i = finger.get_image()
-        if i == adafruit_fingerprint.OK:
-            break
-        elif i == adafruit_fingerprint.NOFINGER:
-            pass
-        else:
-            print(f"Lỗi khi lấy ảnh: {i}")
-            return False, None
-
-    i = finger.image_2_tz(1)
-    if i != adafruit_fingerprint.OK:
-        print(f"Lỗi tạo mẫu ảnh: {i}")
-        return False, None
-
-    i = finger.finger_fast_search()
-    if i == adafruit_fingerprint.OK:
-        location = finger.finger_id
-        confidence = finger.confidence
-        user_db = load_user_db()
-        username = user_db.get(str(location), "Người dùng không xác định")
-        print(f"Xác thực thành công: {username} (ID {location}) - Độ tin cậy: {confidence}")
-        return True, username
+    """
+    Giả lập xác thực vân tay.
+    Trả về (True, username) nếu thành công, (False, None) nếu thất bại.
+    Thực tế bạn phải gọi phần cứng để lấy ID vân tay, rồi tra tên.
+    """
+    # TODO: Gọi phần cứng lấy id vân tay
+    # Giả lập: hỏi người dùng nhập ID (chỉ dùng để test)
+    id_input = input("Nhập ID vân tay để giả lập xác thực: ").strip()
+    data = load_data()
+    if id_input in data:
+        return True, data[id_input]['name']
     else:
-        print("Không tìm thấy vân tay phù hợp")
         return False, None

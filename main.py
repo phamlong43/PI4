@@ -1,25 +1,41 @@
 import pyaudio
 import wave
 import numpy as np
-from python_speech_features import mfcc
-from sklearn.mixture import GaussianMixture
 import pickle
 import os
 import scipy.io.wavfile as wavfile 
 
+# Thêm thư viện SpeechBrain
+import torch
+from speechbrain.inference.speaker import EncoderClassifier
+
 # --- Cấu hình ---
 DINH_DANG = pyaudio.paInt16
 KENH = 1
-TAN_SO_LAY_MAU = 16000 
+TAN_SO_LAY_MAU = 16000 # Hz (SpeechBrain models expect 16kHz)
 KICH_THUOC_KHUNG = 1024
-THOI_GIAN_GHI_AM_LAN_DAU = 5 
-SO_LAN_GHI_AM_DANG_KY = 3 
+THOI_GIAN_GHI_AM_LAN_DAU = 3 # Giây cho mỗi lần ghi âm khi đăng ký/xác minh (có thể ngắn hơn với DL)
+SO_LAN_GHI_AM_DANG_KY = 2 # Số lần người dùng nói khi đăng ký (có thể ít hơn so với GMM)
 
-THU_MUC_NGUOI_DUNG = "enrolled_speakers"
-TEN_FILE_GHI_AM_TAM = "temp_recording.wav" 
+THU_MUC_NGUOI_DUNG = "enrolled_speakers_ai" # Thay đổi thư mục để tránh trùng với GMM
+TEN_FILE_GHI_AM_TAM = "temp_recording_ai.wav" 
 
-# Ngưỡng xác minh. Cần điều chỉnh thực nghiệm.
-NGUONG_XAC_MINH_CO_DINH = -100 
+# Ngưỡng xác minh cho mô hình AI.
+# Giá trị này sẽ rất khác so với GMM (thường là độ tương đồng cosine, gần 1 là giống nhau)
+# Cần điều chỉnh thực nghiệm. Thường là từ 0.7 đến 0.9.
+NGUONG_XAC_MINH_CO_DINH = 0.75 # Ví dụ ngưỡng cho cosine similarity
+
+# --- Khởi tạo mô hình AI (SpeechBrain) ---
+# Tải mô hình ECAPA-TDNN đã được huấn luyện sẵn
+try:
+    classifier = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb", 
+                                                run_opts={"device":"cpu"}) # Force CPU for Raspberry Pi
+    print("Đã tải mô hình AI ECAPA-TDNN thành công.")
+except Exception as e:
+    print(f"Lỗi khi tải mô hình SpeechBrain: {e}")
+    print("Vui lòng đảm bảo bạn có kết nối Internet và các thư viện cần thiết.")
+    print("Nếu lỗi liên quan đến device, hãy kiểm tra lại cài đặt PyTorch của bạn.")
+    classifier = None # Đặt classifier là None nếu không tải được
 
 # --- Hàm hỗ trợ ---
 
@@ -35,7 +51,7 @@ def ghi_am_audio(ten_file, thoi_luong=THOI_GIAN_GHI_AM_LAN_DAU):
     print(f"Đang ghi âm {thoi_luong} giây âm thanh cho '{ten_file}'...")
     frames = []
 
-    for i in range(0, int(TAN_SO_LAY_MA0U / KICH_THUOC_KHUNG * thoi_luong)):
+    for i in range(0, int(TAN_SO_LAY_MAU / KICH_THUOC_KHUNG * thoi_luong)): # Đã sửa lỗi đánh máy TAN_SO_LAY_MAU
         data = stream.read(KICH_THUOC_KHUNG)
         frames.append(data)
 
@@ -51,19 +67,27 @@ def ghi_am_audio(ten_file, thoi_luong=THOI_GIAN_GHI_AM_LAN_DAU):
         wf.setframerate(TAN_SO_LAY_MAU)
         wf.writeframes(b''.join(frames))
 
-def trich_xuat_dac_trung_mfcc(duong_dan_audio):
+def trich_xuat_embedding_ai(audio_path):
+    """Trích xuất embedding giọng nói bằng mô hình AI SpeechBrain."""
+    if classifier is None:
+        print("Mô hình AI chưa được tải. Không thể trích xuất embedding.")
+        return None
     try:
-        (tan_so, tin_hieu) = wavfile.read(duong_dan_audio)
-        if tin_hieu.dtype.kind == 'i': 
-            tin_hieu = tin_hieu.astype(np.float32) / (2**15) 
-        dac_trung_mfcc = mfcc(tin_hieu, tan_so, numcep=13, nfilt=26, nfft=512)
-        return dac_trung_mfcc
+        # Load the audio file and get the embedding
+        # SpeechBrain expects 16kHz audio, check if your recording matches
+        # If not, you might need to resample the audio first (e.g., using torchaudio.transforms.Resample)
+        
+        # This will load, resample (if needed) and normalize
+        signal = classifier.audio_pipeline.convert_audio(audio_path) 
+        # Get the embedding (vector) for the speaker
+        embedding = classifier.encode_batch(signal).cpu().numpy().squeeze()
+        return embedding
     except Exception as e:
-        print(f"Lỗi khi trích xuất MFCC từ {duong_dan_audio}: {e}")
+        print(f"Lỗi khi trích xuất embedding từ {audio_path}: {e}")
         return None
 
-def huan_luyen_mo_hinh_nguoi_noi_da_lan(ten_nguoi_noi, so_lan_ghi_am=SO_LAN_GHI_AM_DANG_KY):
-    tat_ca_dac_trung = []
+def huan_luyen_mo_hinh_nguoi_noi_ai_da_lan(ten_nguoi_noi, so_lan_ghi_am=SO_LAN_GHI_AM_DANG_KY):
+    tat_ca_embeddings = []
     
     thu_muc_ghi_am_dang_ky = os.path.join(THU_MUC_NGUOI_DUNG, "enroll_audios", ten_nguoi_noi)
     os.makedirs(thu_muc_ghi_am_dang_ky, exist_ok=True)
@@ -73,99 +97,99 @@ def huan_luyen_mo_hinh_nguoi_noi_da_lan(ten_nguoi_noi, so_lan_ghi_am=SO_LAN_GHI_
         temp_audio_path = os.path.join(thu_muc_ghi_am_dang_ky, f"enroll_{ten_nguoi_noi}_lan_{i+1}.wav")
         ghi_am_audio(temp_audio_path, thoi_luong=THOI_GIAN_GHI_AM_LAN_DAU)
         
-        dac_trung_lan_nay = trich_xuat_dac_trung_mfcc(temp_audio_path)
-        if dac_trung_lan_nay is None or len(dac_trung_lan_nay) == 0:
-            print(f"Không trích xuất được đặc trưng từ lần ghi âm thứ {i+1}. Vui lòng thử lại.")
+        embedding_lan_nay = trich_xuat_embedding_ai(temp_audio_path)
+        if embedding_lan_nay is None or len(embedding_lan_nay) == 0:
+            print(f"Không trích xuất được embedding từ lần ghi âm thứ {i+1}. Vui lòng thử lại.")
             if os.path.exists(temp_audio_path):
                 os.remove(temp_audio_path)
             return False 
         
-        if len(tat_ca_dac_trung) == 0:
-            tat_ca_dac_trung = dac_trung_lan_nay
-        else:
-            tat_ca_dac_trung = np.vstack((tat_ca_dac_trung, dac_trung_lan_nay))
+        tat_ca_embeddings.append(embedding_lan_nay)
         
         if os.path.exists(temp_audio_path):
             os.remove(temp_audio_path)
 
-    if len(tat_ca_dac_trung) == 0:
-        print(f"Không có đủ đặc trưng để huấn luyện mô hình cho {ten_nguoi_noi}.")
+    if not tat_ca_embeddings:
+        print(f"Không có đủ embeddings để tạo mẫu giọng nói cho {ten_nguoi_noi}.")
         return False
 
-    gmm = GaussianMixture(n_components=16, covariance_type='diag', max_iter=200, random_state=0)
+    # Tính toán vector trung bình (mean embedding) làm mẫu cho người nói
+    speaker_template = np.mean(tat_ca_embeddings, axis=0)
     
-    try:
-        gmm.fit(tat_ca_dac_trung)
-    except ValueError as e:
-        print(f"Lỗi khi khớp GMM cho {ten_nguoi_noi}: {e}. Đảm bảo đủ dữ liệu cho n_components.")
-        return False
-
-    duong_dan_mo_hinh = os.path.join(THU_MUC_NGUOI_DUNG, f"{ten_nguoi_noi}.gmm")
-    with open(duong_dan_mo_hinh, 'wb') as f:
-        pickle.dump(gmm, f)
-    print(f"Mô hình cho '{ten_nguoi_noi}' đã được huấn luyện và lưu vào {duong_dan_mo_hinh}")
+    duong_dan_mau = os.path.join(THU_MUC_NGUOI_DUNG, f"{ten_nguoi_noi}.pkl") # Lưu dưới dạng pickle
+    with open(duong_dan_mau, 'wb') as f:
+        pickle.dump(speaker_template, f)
+    print(f"Mẫu giọng nói AI cho '{ten_nguoi_noi}' đã được huấn luyện và lưu vào {duong_dan_mau}")
     
     if os.path.exists(thu_muc_ghi_am_dang_ky) and not os.listdir(thu_muc_ghi_am_dang_ky):
         os.rmdir(thu_muc_ghi_am_dang_ky)
     
     return True
 
-def xac_minh_nguoi_noi(ten_nguoi_noi, nguong_xac_minh):
-    duong_dan_mo_hinh = os.path.join(THU_MUC_NGUOI_DUNG, f"{ten_nguoi_noi}.gmm")
-    if not os.path.exists(duong_dan_mo_hinh):
-        print(f"Lỗi: Không tìm thấy mô hình cho '{ten_nguoi_noi}'. Vui lòng đăng ký người nói này trước.")
+def xac_minh_nguoi_noi_ai(ten_nguoi_noi, nguong_xac_minh):
+    duong_dan_mau = os.path.join(THU_MUC_NGUOI_DUNG, f"{ten_nguoi_noi}.pkl")
+    if not os.path.exists(duong_dan_mau):
+        print(f"Lỗi: Không tìm thấy mẫu giọng nói AI cho '{ten_nguoi_noi}'. Vui lòng đăng ký người nói này trước.")
         return False, 0.0
 
-    with open(duong_dan_mo_hinh, 'rb') as f:
-        gmm_da_dang_ky = pickle.load(f)
+    with open(duong_dan_mau, 'rb') as f:
+        mau_da_dang_ky = pickle.load(f)
 
     duong_dan_audio_xac_minh = TEN_FILE_GHI_AM_TAM
     ghi_am_audio(duong_dan_audio_xac_minh, thoi_luong=THOI_GIAN_GHI_AM_LAN_DAU)
     
-    dac_trung_kiem_tra = trich_xuat_dac_trung_mfcc(duong_dan_audio_xac_minh)
-    if dac_trung_kiem_tra is None or len(dac_trung_kiem_tra) == 0:
-        print("Không trích xuất được đặc trưng từ âm thanh kiểm tra. Xác minh thất bại.")
+    embedding_kiem_tra = trich_xuat_embedding_ai(duong_dan_audio_xac_minh)
+    if embedding_kiem_tra is None or len(embedding_kiem_tra) == 0:
+        print("Không trích xuất được embedding từ âm thanh kiểm tra. Xác minh thất bại.")
         if os.path.exists(duong_dan_audio_xac_minh):
             os.remove(duong_dan_audio_xac_minh)
         return False, 0.0
 
-    diem_so = gmm_da_dang_ky.score(dac_trung_kiem_tra)
-    
     if os.path.exists(duong_dan_audio_xac_minh):
         os.remove(duong_dan_audio_xac_minh)
 
-    # Tính toán tỷ lệ thành công (accuracy %)
-    # Công thức này mang tính ước lượng và trực quan hóa.
-    # Càng gần ngưỡng từ phía trên, % càng cao.
-    # Ngưỡng càng âm sâu, điểm số âm càng gần 0 thì % càng cao.
-    if diem_so >= 0: # Nếu điểm số không âm, coi như khớp rất tốt
-        ty_le_thanh_cong = 100.0
-    else:
-        # Chuẩn hóa điểm số so với ngưỡng
-        # Ví dụ: Ngưỡng = -100. Điểm = -50 -> tỉ lệ = 50%. Điểm = -10 -> tỉ lệ = 90%.
-        # Điểm = -120 -> tỉ lệ = -20% (sẽ bị cắt về 0).
-        ty_le_thanh_cong = (diem_so - nguong_xac_minh) / abs(nguong_xac_minh) * 100 
-        ty_le_thanh_cong = max(0.0, min(100.0, ty_le_thanh_cong)) # Đảm bảo nằm trong khoảng [0, 100]
+    # Tính toán độ tương đồng Cosine (Cosine Similarity)
+    # Cosine Similarity = (A . B) / (||A|| * ||B||)
+    # Giá trị từ -1 (hoàn toàn khác biệt) đến 1 (hoàn toàn giống nhau)
+    do_tuong_dong = np.dot(mau_da_dang_ky, embedding_kiem_tra) / (np.linalg.norm(mau_da_dang_ky) * np.linalg.norm(embedding_kiem_tra))
 
-    print(f"Điểm xác minh thô: {diem_so:.2f} (Ngưỡng: {nguong_xac_minh:.2f})")
+    # Chuyển độ tương đồng thành tỷ lệ phần trăm trực quan
+    # Nếu ngưỡng là 0.75, và độ tương đồng là 0.85, thì rất phù hợp.
+    # Nếu độ tương đồng là 0.60, thì không phù hợp.
     
-    if diem_so > nguong_xac_minh:
-        print(f"Kết quả: **XÁC MINH THÀNH CÔNG!** Tỷ lệ phù hợp: {ty_le_thanh_cong:.2f}%")
-        return True, ty_le_thanh_cong
+    # Công thức ước lượng % phù hợp, làm cho dễ hiểu
+    if do_tuong_dong >= 1.0: # Hoàn hảo
+        ty_le_phu_hop = 100.0
+    elif do_tuong_dong >= nguong_xac_minh: # Trong khoảng chấp nhận
+        ty_le_phu_hop = 75 + (do_tuong_dong - nguong_xac_minh) / (1.0 - nguong_xac_minh) * 25
+    else: # Dưới ngưỡng
+        # Scale từ -1 đến ngưỡng thành 0-75%
+        ty_le_phu_hop = (do_tuong_dong - (-1.0)) / (nguong_xac_minh - (-1.0)) * 75
+        ty_le_phu_hop = max(0.0, min(75.0, ty_le_phu_hop)) # Đảm bảo nằm trong khoảng [0, 75]
+
+    print(f"Độ tương đồng (Cosine Similarity): {do_tuong_dong:.4f} (Ngưỡng: {nguong_xac_minh:.4f})")
+    
+    if do_tuong_dong > nguong_xac_minh:
+        print(f"Kết quả: **XÁC MINH THÀNH CÔNG!** Tỷ lệ phù hợp: {ty_le_phu_hop:.2f}%")
+        return True, ty_le_phu_hop
     else:
-        print(f"Kết quả: **XÁC MINH THẤT BẠI.** Tỷ lệ phù hợp: {ty_le_thanh_cong:.2f}%")
-        return False, ty_le_thanh_cong
+        print(f"Kết quả: **XÁC MINH THẤT BẠI.** Tỷ lệ phù hợp: {ty_le_phu_hop:.2f}%")
+        return False, ty_le_phu_hop
 
 # --- Logic chính ---
 
 if __name__ == "__main__":
+    if classifier is None:
+        print("Không thể chạy ứng dụng do mô hình AI không được tải.")
+        exit() # Thoát nếu mô hình không tải được
+
     os.makedirs(THU_MUC_NGUOI_DUNG, exist_ok=True)
     os.makedirs(os.path.join(THU_MUC_NGUOI_DUNG, "enroll_audios"), exist_ok=True) 
 
     while True:
-        print("\n--- Menu Xác thực Giọng nói ---")
-        print("1. Đăng ký Người nói Mới (3 lần nói)")
-        print("2. Xác minh Người nói Hiện có")
+        print("\n--- Menu Xác thực Giọng nói (AI) ---")
+        print("1. Đăng ký Người nói Mới (Dùng AI - 2 lần nói)")
+        print("2. Xác minh Người nói Hiện có (Dùng AI)")
         print("3. Thoát")
 
         lua_chon = input("Nhập lựa chọn của bạn: ")
@@ -176,7 +200,7 @@ if __name__ == "__main__":
                 print("Tên người nói không được để trống.")
                 continue
             
-            if huan_luyen_mo_hinh_nguoi_noi_da_lan(ten_nguoi_noi):
+            if huan_luyen_mo_hinh_nguoi_noi_ai_da_lan(ten_nguoi_noi):
                 print(f"Đã đăng ký thành công '{ten_nguoi_noi}'.")
             else:
                 print(f"Không thể đăng ký '{ten_nguoi_noi}'.")
@@ -187,8 +211,7 @@ if __name__ == "__main__":
                 print("Tên người nói không được để trống.")
                 continue
 
-            # Gọi hàm xác minh và nó sẽ tự in kết quả
-            thanh_cong, ty_le = xac_minh_nguoi_noi(ten_nguoi_noi_can_xac_minh, NGUONG_XAC_MINH_CO_DINH)
+            xac_minh_nguoi_noi_ai(ten_nguoi_noi_can_xac_minh, NGUONG_XAC_MINH_CO_DINH)
             
         elif lua_chon == '3':
             print("Đang thoát chương trình.")

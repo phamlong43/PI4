@@ -1,138 +1,66 @@
-import tkinter as tk
-from tkinter import messagebox, scrolledtext
-import fingerprint_app as fapp
-import adafruit_fingerprint
+import cv2
+import mediapipe as mp
+import numpy as np
+import tensorflow as tf
+from collections import deque
 
-class FingerprintGUI:
-    def __init__(self, master):
-        self.master = master
-        self.master.title("Fingerprint Auth System")
+# --- Khởi tạo MediaPipe Pose ---
+mp_pose = mp.solutions.pose
+pose = mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
-        self.db = fapp.load_db()
+# --- Load model TensorFlow Lite ---
+interpreter = tf.lite.Interpreter(model_path="action_model.tflite")
+interpreter.allocate_tensors()
 
-        # Label và Entry nhập tên
-        tk.Label(master, text="Name:").grid(row=0, column=0)
-        self.name_entry = tk.Entry(master)
-        self.name_entry.grid(row=0, column=1)
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
 
-        # Nút chức năng
-        tk.Button(master, text="Add", command=self.add_user).grid(row=1, column=0)
-        tk.Button(master, text="Edit", command=self.edit_user).grid(row=1, column=1)
-        tk.Button(master, text="Delete", command=self.delete_user).grid(row=1, column=2)
-        tk.Button(master, text="Authenticate", command=self.authenticate_user).grid(row=1, column=3)
+# --- Hàm dự đoán ---
+def predict_action(sequence):
+    input_data = np.expand_dims(sequence, axis=0).astype(np.float32)
+    interpreter.set_tensor(input_details[0]['index'], input_data)
+    interpreter.invoke()
+    output_data = interpreter.get_tensor(output_details[0]['index'])
+    return np.argmax(output_data), output_data
 
-        # Vùng log hiển thị trạng thái
-        self.log = scrolledtext.ScrolledText(master, width=60, height=20)
-        self.log.grid(row=2, column=0, columnspan=4)
+# --- Các hành động ---
+actions = ["standing", "walking", "waving", "jumping", "sitting"]  # ví dụ
 
-        self.log_insert("System initialized.")
+# --- Chuỗi lưu landmarks ---
+seq_length = 30
+sequence = deque(maxlen=seq_length)
 
-    def log_insert(self, text):
-        self.log.insert(tk.END, text + "\n")
-        self.log.see(tk.END)
-        self.master.update()
+# --- Mở camera ---
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
 
-    def add_user(self):
-        name = self.name_entry.get().strip()
-        if not name:
-            messagebox.showerror("Error", "Name cannot be empty")
-            return
-        if name in self.db.values():
-            self.log_insert(f"Name '{name}' already exists.")
-            return
-    
-        used_ids = set(map(int, self.db.keys()))
-        for i in range(1, 128):
-            if i not in used_ids:
-                free_id = i
-                break
-        else:
-            self.log_insert("No free ID slot available.")
-            return
-    
-        self.log_insert(f"Register fingerprint for {name} at ID {free_id}")
-    
-        self.log_insert("Please place your finger to check if fingerprint exists...")
-        fid = fapp.search_finger()
-        if fid is not None:
-            existing_name = self.db.get(str(fid), None)
-            self.log_insert(f"Fingerprint already exists for '{existing_name}'. Registration aborted.")
-            return
-    
-        self.log_insert("Place finger 3 times to register.")
-        success, msg = fapp.enroll_finger(free_id)
-        if success:
-            self.db[str(free_id)] = name
-            fapp.save_db(self.db)
-            self.log_insert(f"User '{name}' registered successfully with ID {free_id}.")
-        else:
-            self.log_insert(f"Enrollment failed: {msg}")
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
 
-    def edit_user(self):
-        name = self.name_entry.get().strip()
-        if not name:
-            messagebox.showerror("Error", "Name cannot be empty")
-            return
-        # Tìm ID theo tên
-        found_id = None
-        for k, v in self.db.items():
-            if v == name:
-                found_id = int(k)
-                break
-        if not found_id:
-            self.log_insert(f"User '{name}' not found.")
-            return
-        self.log_insert(f"Editing fingerprint for '{name}' with ID {found_id}")
-        # Xóa mẫu cũ
-        if fapp.delete_finger(found_id) != adafruit_fingerprint.OK:
-            self.log_insert("Failed to delete old fingerprint template.")
-            return
-        # Enroll lại
-        self.log_insert("Place finger 3 times to re-register.")
-        success = fapp.enroll_finger(found_id)
-        if success:
-            self.log_insert(f"Fingerprint for '{name}' updated successfully.")
-        else:
-            self.log_insert("Failed to update fingerprint.")
+    frame = cv2.flip(frame, 1)
+    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = pose.process(img_rgb)
 
-    def delete_user(self):
-        name = self.name_entry.get().strip()
-        if not name:
-            messagebox.showerror("Error", "Name cannot be empty")
-            return
-        found_id = None
-        for k, v in self.db.items():
-            if v == name:
-                found_id = int(k)
-                break
-        if not found_id:
-            self.log_insert(f"User '{name}' not found.")
-            return
-        if fapp.delete_finger(found_id) == adafruit_fingerprint.OK:
-            del self.db[str(found_id)]
-            fapp.save_db(self.db)
-            self.log_insert(f"User '{name}' deleted successfully.")
-        else:
-            self.log_insert("Failed to delete fingerprint template.")
+    if results.pose_landmarks:
+        mp.solutions.drawing_utils.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+        landmarks = results.pose_landmarks.landmark
+        pose_array = np.array([[lm.x, lm.y, lm.z] for lm in landmarks]).flatten()
+        sequence.append(pose_array)
 
-    def authenticate_user(self):
-        self.log_insert("Please place your finger to authenticate...")
-        fid, confidence = fapp.search_finger()
-        if fid is None:
-            # Nếu muốn, có thể phân biệt thêm để không báo lỗi ngay
-            self.log_insert("No finger detected yet.")
-            return
-        name = self.db.get(str(fid), None)
-        if name:
-            self.log_insert(f"Authenticated: {name} (Confidence: {confidence})")
-        else:
-            self.log_insert(f"Fingerprint ID {fid} found but no associated name.")
+        if len(sequence) == seq_length:
+            action_id, confidence = predict_action(np.array(sequence))
+            text = f"Action: {actions[action_id]} ({confidence[0][action_id]:.2f})"
+            cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7, (0, 255, 0), 2)
+    else:
+        sequence.clear()  # reset nếu không phát hiện người
 
+    cv2.imshow("Human Action Recognition", frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
 
-def main():
-    root = tk.Tk()
-    app = FingerprintGUI(root)
-    root.mainloop()
-
-if __name__ == "__main__":
-    main()
+cap.release()
+cv2.destroyAllWindows()

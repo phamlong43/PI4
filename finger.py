@@ -1,99 +1,121 @@
-import json
-import time
-import adafruit_fingerprint
-import serial
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/kernel.h>
 
-DB_FILE = "finger_db.json"
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Hoang Duc Luong");
+MODULE_DESCRIPTION("Module kernel tinh vector, ma tran va chinh hop");
+MODULE_VERSION("1.0");
 
-# Kết nối cảm biến vân tay
-uart = serial.Serial("/dev/ttyS0", baudrate=57600, timeout=1)
-finger = adafruit_fingerprint.Adafruit_Fingerprint(uart)
+#define SIZE 3  // kich thuoc vi du cho vector va ma tran
 
-# Đọc cơ sở dữ liệu JSON
-def load_db():
-    try:
-        with open(DB_FILE, "r") as f:
-            return json.load(f)
-    except:
-        return {}
+// Ham tinh tich vo huong cua hai vector
+int tinh_tich_vo_huong(int *v1, int *v2, int size) {
+    int ket_qua = 0;
+    int i;
+    for (i = 0; i < size; i++) {
+        ket_qua += v1[i] * v2[i];
+    }
+    return ket_qua;
+}
 
-# Lưu cơ sở dữ liệu JSON
-def save_db(db):
-    with open(DB_FILE, "w") as f:
-        json.dump(db, f)
+// Ham tinh tong hai ma tran
+void tinh_tong_ma_tran(int m1[SIZE][SIZE], int m2[SIZE][SIZE], int ket_qua[SIZE][SIZE]) {
+    int i, j;
+    for (i = 0; i < SIZE; i++) {
+        for (j = 0; j < SIZE; j++) {
+            ket_qua[i][j] = m1[i][j] + m2[i][j];
+        }
+    }
+}
 
-def read_templates():
-    return finger.read_templates()
+// Ham tinh hieu hai ma tran
+void tinh_hieu_ma_tran(int m1[SIZE][SIZE], int m2[SIZE][SIZE], int ket_qua[SIZE][SIZE]) {
+    int i, j;
+    for (i = 0; i < SIZE; i++) {
+        for (j = 0; j < SIZE; j++) {
+            ket_qua[i][j] = m1[i][j] - m2[i][j];
+        }
+    }
+}
 
-def enroll_finger(location):
-    for fingerimg in range(1, 4):  # 3 lần đặt ngón tay
-        if fingerimg == 1:
-            print("Place finger on sensor...")
-        else:
-            print("Place same finger again...")
-        start_time = time.time()
-        while True:
-            i = finger.get_image()
-            if i == adafruit_fingerprint.OK:
-                print("Image taken")
-                break
-            elif i == adafruit_fingerprint.NOFINGER:
-                # Nếu quá 10s không có ngón tay đặt, báo lỗi
-                if time.time() - start_time > 10:
-                    return False, "Timeout: No finger detected"
-            elif i == adafruit_fingerprint.IMAGEFAIL:
-                return False, "Imaging error"
-            else:
-                return False, f"Error code: {i}"
-        print("Templating...")
-        i = finger.image_2_tz(fingerimg)
-        if i != adafruit_fingerprint.OK:
-            return False, f"Failed to template (code {i})"
-        if fingerimg < 3:
-            print("Remove finger")
-            time.sleep(1)
-            # Đợi tới khi ngón tay được rút ra
-            while finger.get_image() != adafruit_fingerprint.NOFINGER:
-                pass
-    print("Creating model...")
-    i = finger.create_model()
-    if i != adafruit_fingerprint.OK:
-        return False, f"Failed to create model (code {i})"
-    print(f"Storing model #{location}...")
-    i = finger.store_model(location)
-    if i != adafruit_fingerprint.OK:
-        return False, f"Failed to store model (code {i})"
-    return True, "Enrollment successful"
+// Ham tinh tich hai ma tran
+void tinh_tich_ma_tran(int m1[SIZE][SIZE], int m2[SIZE][SIZE], int ket_qua[SIZE][SIZE]) {
+    int i, j, k;
+    for (i = 0; i < SIZE; i++) {
+        for (j = 0; j < SIZE; j++) {
+            ket_qua[i][j] = 0;
+            for (k = 0; k < SIZE; k++) {
+                ket_qua[i][j] += m1[i][k] * m2[k][j];
+            }
+        }
+    }
+}
 
+// Ham tinh giai thua
+unsigned long tinh_giai_thua(int n) {
+    unsigned long ket_qua = 1;
+    int i;
+    for (i = 1; i <= n; i++) {
+        ket_qua *= i;
+    }
+    return ket_qua;
+}
 
-def delete_finger(location):
-    return finger.delete_model(location)
+// Ham tinh chinh hop A(n, k)
+unsigned long tinh_chinh_hop(int n, int k) {
+    return tinh_giai_thua(n) / tinh_giai_thua(n - k);
+}
 
-def search_finger():
-    print("Waiting for finger...")
-    while True:
-        i = finger.get_image()
-        if i == adafruit_fingerprint.OK:
-            break
-        elif i == adafruit_fingerprint.NOFINGER:
-            # chưa có ngón tay, tiếp tục chờ
-            continue
-        else:
-            print(f"Error getting image: code {i}")
-            return None, None
+static int __init bai3_1_init(void) {
+    printk(KERN_INFO "[bai3.1] Module duoc nap vao kernel\n");
 
-    i = finger.image_2_tz(1)
-    if i != adafruit_fingerprint.OK:
-        print(f"Error templating image: code {i}")
-        return None, None
+    int v1[SIZE] = {1, 2, 3};
+    int v2[SIZE] = {4, 5, 6};
+    int m1[SIZE][SIZE] = {{1, 2, 3}, {4, 5, 6}, {7, 8, 9}};
+    int m2[SIZE][SIZE] = {{9, 8, 7}, {6, 5, 4}, {3, 2, 1}};
+    int ket_qua_ma_tran[SIZE][SIZE];
 
-    i = finger.finger_fast_search()
-    if i == adafruit_fingerprint.OK:
-        return finger.finger_id, finger.confidence
-    elif i == adafruit_fingerprint.NOTFOUND:
-        print("No matching fingerprint found.")
-        return None, None
-    else:
-        print(f"Error searching fingerprint: code {i}")
-        return None, None
+    int tich_vo_huong = tinh_tich_vo_huong(v1, v2, SIZE);
+    printk(KERN_INFO "Tich vo huong: %d\n", tich_vo_huong);
 
+    tinh_tong_ma_tran(m1, m2, ket_qua_ma_tran);
+    printk(KERN_INFO "Tong ma tran:\n");
+    int i, j;
+    for (i = 0; i < SIZE; i++) {
+        for (j = 0; j < SIZE; j++) {
+            printk(KERN_INFO "%d ", ket_qua_ma_tran[i][j]);
+        }
+        printk(KERN_INFO "\n");
+    }
+
+    tinh_hieu_ma_tran(m1, m2, ket_qua_ma_tran);
+    printk(KERN_INFO "Hieu ma tran:\n");
+    for (i = 0; i < SIZE; i++) {
+        for (j = 0; j < SIZE; j++) {
+            printk(KERN_INFO "%d ", ket_qua_ma_tran[i][j]);
+        }
+        printk(KERN_INFO "\n");
+    }
+
+    tinh_tich_ma_tran(m1, m2, ket_qua_ma_tran);
+    printk(KERN_INFO "Tich ma tran:\n");
+    for (i = 0; i < SIZE; i++) {
+        for (j = 0; j < SIZE; j++) {
+            printk(KERN_INFO "%d ", ket_qua_ma_tran[i][j]);
+        }
+        printk(KERN_INFO "\n");
+    }
+
+    unsigned long chinh_hop = tinh_chinh_hop(5, 2);
+    printk(KERN_INFO "Chinh hop A(5, 2): %lu\n", chinh_hop);
+
+    return 0;
+}
+
+static void __exit bai3_1_exit(void) {
+    printk(KERN_INFO "[bai3.1] Module da duoc go khoi kernel\n");
+}
+
+module_init(bai3_1_init);
+module_exit(bai3_1_exit);

@@ -1,101 +1,139 @@
 import cv2
 import mediapipe as mp
 import numpy as np
-import os
-import time
 import pickle
+import os
+from sklearn.neural_network import MLPClassifier
+from sklearn.metrics.pairwise import cosine_similarity
 
-# Khởi tạo MediaPipe FaceMesh
-mp_face_mesh = mp.solutions.face_mesh
-mp_drawing = mp.solutions.drawing_utils
-drawing_spec = mp_drawing.DrawingSpec(thickness=1, circle_radius=1)
+CUSTOM_IDX = [
+    10, 338, 297, 332, 284, 251, 389, 356, 454,
+    234, 93, 132, 127, 162, 107, 55, 103,
+    70, 63, 105, 66, 107,
+    336, 296, 334, 293, 300,
+    168, 6, 197, 195,
+    5, 4, 1, 19, 94,
+    33, 160, 158, 133, 153, 144,
+    362, 385, 387, 263, 373, 380,
+    67, 69, 108, 109, 151, 337, 299, 298, 301, 447,
+    345, 446, 265, 353, 276, 283, 282, 285, 336, 330
+]
 
-face_mesh = mp_face_mesh.FaceMesh(
-    static_image_mode=False,
-    max_num_faces=1,
-    refine_landmarks=True,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
-)
+DB_PATH = "csdl"
+os.makedirs(DB_PATH, exist_ok=True)
 
-# Đường dẫn thư mục lưu embeddings
-EMBED_DIR = "embeddings"
-if not os.path.exists(EMBED_DIR):
-    os.makedirs(EMBED_DIR)
+mp_face = mp.solutions.face_mesh
+face_mesh = mp_face.FaceMesh(static_image_mode=False, max_num_faces=1)
 
-# Hàm lấy embedding từ landmarks (chỉ lấy phần trên khuôn mặt để tránh khẩu trang)
-def extract_embedding(face_landmarks):
-    upper_ids = list(range(10, 338))  # bỏ phần cằm dưới
-    landmarks = []
-    for idx in upper_ids:
-        lm = face_landmarks.landmark[idx]
-        landmarks.append([lm.x, lm.y, lm.z])
-    return np.array(landmarks).flatten()
+def normalize_landmarks(landmarks):
+    points = np.array([[landmarks[i].x, landmarks[i].y] for i in CUSTOM_IDX])
+    center = np.mean(points, axis=0)
+    centered = points - center
+    cov = np.cov(centered.T)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    rotation_matrix = eigvecs
+    aligned = centered @ rotation_matrix
+    norm = np.linalg.norm(aligned)
+    if norm > 0:
+        aligned /= norm
+    return aligned.flatten()
 
-# Hàm so sánh embedding hiện tại với cơ sở dữ liệu
-def recognize(embedding_now, threshold=0.25):
-    for file in os.listdir(EMBED_DIR):
-        if file.endswith(".npy"):
-            name = file[:-4]
-            saved_embedding = np.load(os.path.join(EMBED_DIR, file))
-            dist = np.linalg.norm(saved_embedding - embedding_now)
-            if dist < threshold:
-                return name
-    return "Unknown"
+def luu(name, vec):
+    with open(os.path.join(DB_PATH, f"{name}.pkl"), "wb") as f:
+        pickle.dump(vec, f)
 
-# Khởi động webcam
+def tai():
+    X, y = [], []
+    for file in os.listdir(DB_PATH):
+        with open(os.path.join(DB_PATH, file), "rb") as f:
+            X.append(pickle.load(f))
+            y.append(file[:-4])
+    return np.array(X), np.array(y)
+
+MODEL_PATH = "mlp_model.pkl"
+if os.path.exists(MODEL_PATH):
+    with open(MODEL_PATH, "rb") as f:
+        model = pickle.load(f)
+else:
+    model = MLPClassifier(hidden_layer_sizes=(64,), max_iter=500)
+    X, y = tai()
+    if len(X) > 0:
+        model.fit(X, y)
+        with open(MODEL_PATH, "wb") as f:
+            pickle.dump(model, f)
+
 cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-
-print("Ấn 'r' để đăng ký, ESC để thoát.")
-
-while cap.isOpened():
+print("Nhan 'r' de dang ky, 'q' de thoat.")
+while True:
     ret, frame = cap.read()
     if not ret:
-        print("Không thể truy cập webcam.")
-        break
+        continue
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    ketqua = face_mesh.process(rgb)
 
-    image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    image.flags.writeable = False
-    results = face_mesh.process(image)
-    image.flags.writeable = True
+    if ketqua.multi_face_landmarks:
+        lm = ketqua.multi_face_landmarks[0].landmark
+        vec = normalize_landmarks(lm)
+        try:
+            THRESHOLD_PROBA = 0.85
+            THRESHOLD_COSINE = 0.85
+            probs = model.predict_proba([vec])[0]
+            prob = np.max(probs)
+            label = model.classes_[np.argmax(probs)]
 
-    frame_out = frame.copy()
-
-    if results.multi_face_landmarks:
-        for face_landmarks in results.multi_face_landmarks:
-            mp_drawing.draw_landmarks(
-                frame_out,
-                face_landmarks,
-                mp_face_mesh.FACEMESH_TESSELATION,
-                landmark_drawing_spec=drawing_spec,
-                connection_drawing_spec=drawing_spec
-            )
-
-            # Tính embedding
-            embedding = extract_embedding(face_landmarks)
-
-            # Kiểm tra phím nhấn
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('r'):
-                name = input("Nhập tên để đăng ký: ")
-                save_path = os.path.join(EMBED_DIR, f"{name}.npy")
-                np.save(save_path, embedding)
-                print(f"Đã lưu khuôn mặt của {name}")
+            if len(model.classes_) == 1:
+                if prob == 1.0:
+                    db_vecs, db_labels = tai()
+                    cos_sim = cosine_similarity([vec], [db_vecs[0]])[0][0]
+                    if cos_sim >= THRESHOLD_COSINE:
+                        txt = f"{db_labels[0]} ({cos_sim:.2f})"
+                    else:
+                        txt = "Nguoi la"
+                else:
+                    txt = "Nguoi la"
             else:
-                name = recognize(embedding)
-                cv2.putText(frame_out, name, (30, 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.2,
-                            (0, 255, 0) if name != "Unknown" else (0, 0, 255), 2)
+                idx = np.argmax(probs)
+                db_vecs, db_labels = tai()
+                matched_vec = db_vecs[idx]
+                cos_sim = cosine_similarity([vec], [matched_vec])[0][0]
+                if prob >= THRESHOLD_PROBA and cos_sim >= THRESHOLD_COSINE:
+                    txt = f"{label} ({prob:.2f}, {cos_sim:.2f})"
+                else:
+                    txt = "Nguoi la"
+        except:
+            txt = "Chua co model"
 
-    else:
-        cv2.putText(frame_out, "Không thấy khuôn mặt", (30, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+        cv2.putText(frame, txt, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
-    cv2.imshow("Face Recognition", frame_out)
+        for i in CUSTOM_IDX:
+            p = lm[i]
+            x, y = int(p.x * frame.shape[1]), int(p.y * frame.shape[0])
+            cv2.circle(frame, (x, y), 1, (0, 0, 255), -1)
 
-    if cv2.waitKey(1) & 0xFF == 27:
+    cv2.imshow("Nhan dien khuon mat", frame)
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord("r"):
+        ten = input("Nhap ten nguoi dung: ")
+        vecs = []
+        print("Dang ky 5 mau mat, vui long giu nguyen khuon mat.")
+        for i in range(5):
+            input(f"Nhan Enter khi san sang cho anh thu {i+1}...")
+            ret, frame = cap.read()
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            ketqua = face_mesh.process(rgb)
+            if ketqua.multi_face_landmarks:
+                lm = ketqua.multi_face_landmarks[0].landmark
+                vec = normalize_landmarks(lm)
+                vecs.append(vec)
+        if vecs:
+            mean_vec = np.mean(vecs, axis=0)
+            luu(ten, mean_vec)
+            X, y = tai()
+            model.fit(X, y)
+            with open(MODEL_PATH, "wb") as f:
+                pickle.dump(model, f)
+            print(f"Da luu cho {ten} va cap nhat model")
+    elif key == ord("q"):
         break
 
 cap.release()

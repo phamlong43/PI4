@@ -3,19 +3,15 @@ import numpy as np
 import os
 from itertools import combinations
 import random
-import mediapipe as mp
-
-# MediaPipe Face Mesh setup
-mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(static_image_mode=False, max_num_faces=1, refine_landmarks=True)
-
-# Use 468 full landmarks from MediaPipe
-LANDMARK_INDEXES = list(range(468))
+from insightface.app import FaceAnalysis
 
 DB_FILE = "face_db.npz"
 embeddings = []
 labels = []
-THRESHOLD = 0.5
+THRESHOLD = 0.8
+
+app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
+app.prepare(ctx_id=0)
 
 if os.path.exists(DB_FILE):
     data = np.load(DB_FILE, allow_pickle=True)
@@ -40,13 +36,11 @@ def suggest_optimal_threshold():
     if not diff_dists:
         return
 
-    thresholds = np.linspace(0.2, 5.0, 250)
-    best_threshold = 0.5
+    thresholds = np.linspace(0.2, 2.0, 250)
+    best_threshold = 0.8
     best_acc = 0
 
     for t in thresholds:
-        if t >= 0.5:
-            continue
         tp = np.sum(np.array(same_dists) <= t)
         fn = np.sum(np.array(same_dists) > t)
         tn = np.sum(np.array(diff_dists) > t)
@@ -66,22 +60,10 @@ def save_db():
     np.savez(DB_FILE, embeddings=embeddings, labels=labels)
 
 def compute_embedding(image):
-    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    results = face_mesh.process(rgb)
-    if results.multi_face_landmarks:
-        landmarks = results.multi_face_landmarks[0]
-        h, w = image.shape[:2]
-        coords = []
-        for idx in LANDMARK_INDEXES:
-            lm = landmarks.landmark[idx]
-            coords.append(lm.x)
-            coords.append(lm.y)
-        return np.array(coords, dtype=np.float32)
+    faces = app.get(image)
+    if faces:
+        return faces[0].embedding
     return None
-
-def is_face_centered(frame_shape):
-    # MediaPipe doesn't return bounding boxes like Dlib, so we skip center check
-    return True
 
 def register_multi_pose(cap):
     required_poses = ["frontal"]
@@ -146,7 +128,7 @@ def verify_faces_on_frame(frame):
 
     for name, reg_emb in zip(labels, embeddings):
         dist, matched = compare_embeddings(reg_emb, emb)
-        score = max(0, 1 - dist) * 100
+        score = max(0, 1 - dist / THRESHOLD) * 100
         if matched and score > max_score:
             matched_name = name
             max_score = score
@@ -156,7 +138,8 @@ def verify_faces_on_frame(frame):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
 def main():
-    cap = cv2.VideoCapture(0)
+    stream_url = "https://3945-2402-800-6106-e118-ec93-b42a-93f3-6d7b.ngrok-free.app/video_feed"
+    cap = cv2.VideoCapture(stream_url)
 
     if not cap.isOpened():
         print("[-] Khong the ket noi den stream MJPEG.")

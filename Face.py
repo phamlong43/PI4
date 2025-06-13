@@ -3,15 +3,17 @@ import numpy as np
 import os
 from itertools import combinations
 import random
-from insightface.app import FaceAnalysis
+import mediapipe as mp
 
 DB_FILE = "face_db.npz"
 embeddings = []
 labels = []
 THRESHOLD = 0.8
 
-app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
-app.prepare(ctx_id=0)
+mp_face_mesh = mp.solutions.face_mesh
+face_mesh = mp_face_mesh.FaceMesh(static_image_mode=False, max_num_faces=1, refine_landmarks=True, min_detection_confidence=0.5)
+
+LANDMARK_INDEXES = list(range(468))
 
 if os.path.exists(DB_FILE):
     data = np.load(DB_FILE, allow_pickle=True)
@@ -60,10 +62,19 @@ def save_db():
     np.savez(DB_FILE, embeddings=embeddings, labels=labels)
 
 def compute_embedding(image):
-    faces = app.get(image)
-    if faces:
-        return faces[0].embedding
-    return None
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    results = face_mesh.process(image_rgb)
+    if not results.multi_face_landmarks:
+        return None
+
+    face_landmarks = results.multi_face_landmarks[0]
+    h, w, _ = image.shape
+    points = []
+    for idx in LANDMARK_INDEXES:
+        lm = face_landmarks.landmark[idx]
+        points.extend([lm.x, lm.y, lm.z])
+
+    return np.array(points)
 
 def register_multi_pose(cap):
     required_poses = ["frontal"]

@@ -4,26 +4,13 @@ import os
 from itertools import combinations
 import random
 import mediapipe as mp
-import dlib
-
-# Load models
-face_encoder = dlib.face_recognition_model_v1("dlib_face_recognition_resnet_model_v1.dat")
-face_detector = dlib.get_frontal_face_detector()
 
 # MediaPipe Face Mesh setup
 mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(static_image_mode=False, max_num_faces=1, refine_landmarks=True)
 
-# Approximate mapping: MediaPipe 468-point -> 68 landmark indexes (to simulate Dlib format)
-LANDMARK_68_INDEXES = [
-    10,  338, 297, 332, 284, 251, 389, 356, 454, 323,
-    361, 288, 397, 365, 379, 378, 400, 377, 152, 148,
-    176, 149, 150, 136, 172, 58, 132, 93, 234, 127,
-    162, 21, 54, 103, 67, 109, 10, 338, 297, 332,
-    284, 251, 389, 356, 454, 323, 361, 288, 397, 365,
-    379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
-    172, 58, 132, 93, 234, 127, 162, 21
-][:68]  # Ensure 68 points
+# Use 468 full landmarks from MediaPipe
+LANDMARK_INDEXES = list(range(468))
 
 DB_FILE = "face_db.npz"
 embeddings = []
@@ -78,37 +65,23 @@ def compare_embeddings(embedding1, embedding2):
 def save_db():
     np.savez(DB_FILE, embeddings=embeddings, labels=labels)
 
-def compute_embedding(image, face_rect):
+def compute_embedding(image):
     rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     results = face_mesh.process(rgb)
+    if results.multi_face_landmarks:
+        landmarks = results.multi_face_landmarks[0]
+        h, w = image.shape[:2]
+        coords = []
+        for idx in LANDMARK_INDEXES:
+            lm = landmarks.landmark[idx]
+            coords.append(lm.x)
+            coords.append(lm.y)
+        return np.array(coords, dtype=np.float32)
+    return None
 
-    if not results.multi_face_landmarks:
-        return None
-
-    landmarks = results.multi_face_landmarks[0]
-    h, w = image.shape[:2]
-
-    points = []
-    for idx in LANDMARK_68_INDEXES:
-        if idx >= len(landmarks.landmark):
-            continue
-        lm = landmarks.landmark[idx]
-        x = int(lm.x * w)
-        y = int(lm.y * h)
-        points.append(dlib.point(x, y))
-
-    if len(points) != 68:
-        return None
-
-    return np.array(face_encoder.compute_face_descriptor(image, points, 1))
-
-def is_face_centered(face_rect, frame_shape, threshold_ratio=0.2):
-    face_center_x = (face_rect.left() + face_rect.right()) // 2
-    face_center_y = (face_rect.top() + face_rect.bottom()) // 2
-    frame_center_x = frame_shape[1] // 2
-    frame_center_y = frame_shape[0] // 2
-    center_diff = np.linalg.norm([face_center_x - frame_center_x, face_center_y - frame_center_y])
-    return center_diff < threshold_ratio * min(frame_shape[0], frame_shape[1])
+def is_face_centered(frame_shape):
+    # MediaPipe doesn't return bounding boxes like Dlib, so we skip center check
+    return True
 
 def register_multi_pose(cap):
     required_poses = ["frontal"]
@@ -132,35 +105,20 @@ def register_multi_pose(cap):
             if not ret:
                 break
 
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = face_detector(gray)
-
-            if len(faces) > 0:
-                face_rect = faces[0]
-
-                if is_face_centered(face_rect, frame.shape):
-                    cv2.rectangle(frame, (face_rect.left(), face_rect.top()), (face_rect.right(), face_rect.bottom()), (0, 255, 0), 2)
-                    cv2.putText(frame, "Nhan 'c' de chup", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-                    cv2.imshow("Dang ky", frame)
-
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == ord('c'):
-                        emb = compute_embedding(frame, face_rect)
-                        if emb is None:
-                            continue
-                        for saved_emb in embeddings:
-                            if np.linalg.norm(emb - saved_emb) < THRESHOLD:
-                                print("[!] Khuon mat da ton tai trong he thong.")
-                                cv2.destroyWindow("Dang ky")
-                                return
-                        captured_embeddings.append(emb)
-                        print(f"[+] Da chup goc {pose}")
-                        pose_captured = True
-                else:
-                    cv2.putText(frame, "Can giua khung hinh!", (10, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                    cv2.imshow("Dang ky", frame)
-                    cv2.waitKey(1)
+            emb = compute_embedding(frame)
+            if emb is not None:
+                cv2.putText(frame, "Nhan 'c' de chup", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                cv2.imshow("Dang ky", frame)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('c'):
+                    for saved_emb in embeddings:
+                        if np.linalg.norm(emb - saved_emb) < THRESHOLD:
+                            print("[!] Khuon mat da ton tai trong he thong.")
+                            cv2.destroyWindow("Dang ky")
+                            return
+                    captured_embeddings.append(emb)
+                    print(f"[+] Da chup goc {pose}")
+                    pose_captured = True
             else:
                 cv2.putText(frame, "Khong tim thay khuon mat", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
@@ -179,28 +137,23 @@ def register_multi_pose(cap):
     cv2.destroyWindow("Dang ky")
 
 def verify_faces_on_frame(frame):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces = face_detector(gray)
+    emb = compute_embedding(frame)
+    if emb is None:
+        return
 
-    for face_rect in faces:
-        emb = compute_embedding(frame, face_rect)
-        if emb is None:
-            continue
+    matched_name = "Unknown"
+    max_score = 0.0
 
-        matched_name = "Unknown"
-        max_score = 0.0
+    for name, reg_emb in zip(labels, embeddings):
+        dist, matched = compare_embeddings(reg_emb, emb)
+        score = max(0, 1 - dist) * 100
+        if matched and score > max_score:
+            matched_name = name
+            max_score = score
 
-        for name, reg_emb in zip(labels, embeddings):
-            dist, matched = compare_embeddings(reg_emb, emb)
-            score = max(0, 1 - dist) * 100
-            if matched and score > max_score:
-                matched_name = name
-                max_score = score
-
-        cv2.rectangle(frame, (face_rect.left(), face_rect.top()), (face_rect.right(), face_rect.bottom()), (0, 255, 0), 2)
-        text = f"{matched_name} ({max_score:.2f}%)"
-        cv2.putText(frame, text, (face_rect.left(), face_rect.top() - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+    h, w = frame.shape[:2]
+    cv2.putText(frame, f"{matched_name} ({max_score:.2f}%)", (10, h - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
 def main():
     cap = cv2.VideoCapture(0)

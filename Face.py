@@ -1,114 +1,102 @@
 import cv2
 import mediapipe as mp
-import dlib
 import numpy as np
-import pickle
 import os
+import time
+import pickle
 
-# MediaPipe
-mp_face = mp.solutions.face_detection
+# Khởi tạo MediaPipe FaceMesh
+mp_face_mesh = mp.solutions.face_mesh
+mp_drawing = mp.solutions.drawing_utils
+drawing_spec = mp_drawing.DrawingSpec(thickness=1, circle_radius=1)
 
-# Dlib
-face_detector = dlib.get_frontal_face_detector()
-shape_predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
-face_rec_model = dlib.face_recognition_model_v1("dlib_face_recognition_resnet_model_v1.dat")
+face_mesh = mp_face_mesh.FaceMesh(
+    static_image_mode=False,
+    max_num_faces=1,
+    refine_landmarks=True,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
 
-# Load database
-DB_PATH = "faces.pkl"
-try:
-    with open(DB_PATH, "rb") as f:
-        face_db = pickle.load(f)
-    if not isinstance(face_db, dict):
-        face_db = {}
-except:
-    face_db = {}
+# Đường dẫn thư mục lưu embeddings
+EMBED_DIR = "embeddings"
+if not os.path.exists(EMBED_DIR):
+    os.makedirs(EMBED_DIR)
 
-def get_face_embedding(image, rect):
-    shape = shape_predictor(image, rect)
-    descriptor = face_rec_model.compute_face_descriptor(image, shape)
-    return np.array(descriptor)
+# Hàm lấy embedding từ landmarks (chỉ lấy phần trên khuôn mặt để tránh khẩu trang)
+def extract_embedding(face_landmarks):
+    upper_ids = list(range(10, 338))  # bỏ phần cằm dưới
+    landmarks = []
+    for idx in upper_ids:
+        lm = face_landmarks.landmark[idx]
+        landmarks.append([lm.x, lm.y, lm.z])
+    return np.array(landmarks).flatten()
 
-def register_face(name, embedding):
-    face_db[name] = embedding
-    with open(DB_PATH, "wb") as f:
-        pickle.dump(face_db, f)
-    print(f"[INFO] Đã lưu khuôn mặt cho {name}")
+# Hàm so sánh embedding hiện tại với cơ sở dữ liệu
+def recognize(embedding_now, threshold=0.25):
+    for file in os.listdir(EMBED_DIR):
+        if file.endswith(".npy"):
+            name = file[:-4]
+            saved_embedding = np.load(os.path.join(EMBED_DIR, file))
+            dist = np.linalg.norm(saved_embedding - embedding_now)
+            if dist < threshold:
+                return name
+    return "Unknown"
 
-def recognize_face(embedding, threshold=0.6):
-    for name, db_emb in face_db.items():
-        dist = np.linalg.norm(db_emb - embedding)
-        if dist < threshold:
-            return name, dist
-    return "Unknown", None
-
+# Khởi động webcam
 cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    print("[ERROR] Không mở được camera.")
-    exit()
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-print("[INFO] Bắt đầu camera. Nhấn 'r' để đăng ký, 'q' để thoát.")
+print("Ấn 'r' để đăng ký, ESC để thoát.")
 
-with mp_face.FaceDetection(model_selection=0, min_detection_confidence=0.5) as face_detection:
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        print("Không thể truy cập webcam.")
+        break
 
-        small_frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
-        rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-        results = face_detection.process(rgb_small)
+    image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    image.flags.writeable = False
+    results = face_mesh.process(image)
+    image.flags.writeable = True
 
-        if results.detections:
-            for det in results.detections:
-                bbox = det.location_data.relative_bounding_box
-                h, w, _ = small_frame.shape
-                x1, y1 = int(bbox.xmin * w), int(bbox.ymin * h)
-                x2, y2 = int((bbox.xmin + bbox.width) * w), int((bbox.ymin + bbox.height) * h)
+    frame_out = frame.copy()
 
-                x1, y1 = max(x1, 0), max(y1, 0)
-                x2, y2 = min(x2, w), min(y2, h)
-                face_img = small_frame[y1:y2, x1:x2]
+    if results.multi_face_landmarks:
+        for face_landmarks in results.multi_face_landmarks:
+            mp_drawing.draw_landmarks(
+                frame_out,
+                face_landmarks,
+                mp_face_mesh.FACEMESH_TESSELATION,
+                landmark_drawing_spec=drawing_spec,
+                connection_drawing_spec=drawing_spec
+            )
 
-                rects = face_detector(cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB))
-                if rects:
-                    emb = get_face_embedding(cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB), rects[0])
-                    name, dist = recognize_face(emb)
-                    if name != "Unknown":
-                        color = (0, 255, 0)
-                        label = f"✅ {name}"
-                    else:
-                        color = (0, 0, 255)
-                        label = "❌ Unknown"
+            # Tính embedding
+            embedding = extract_embedding(face_landmarks)
 
-                    cv2.rectangle(small_frame, (x1, y1), (x2, y2), color, 2)
-                    cv2.putText(small_frame, label, (x1, y1 - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-
-        cv2.imshow("Face Auth - Press R to Register", small_frame)
-        key = cv2.waitKey(1) & 0xFF
-
-        if key == ord('q'):
-            break
-        elif key == ord('r'):
-            name = input("Nhập tên: ")
-            print("[INFO] Chụp mặt không đeo khẩu trang...")
-            cv2.waitKey(2000)
-            ret, frame1 = cap.read()
-            rects = face_detector(cv2.cvtColor(frame1, cv2.COLOR_BGR2RGB))
-            if rects:
-                emb1 = get_face_embedding(cv2.cvtColor(frame1, cv2.COLOR_BGR2RGB), rects[0])
-                print("[INFO] Đeo khẩu trang và giữ nguyên...")
-                cv2.waitKey(5000)
-                ret, frame2 = cap.read()
-                rects2 = face_detector(cv2.cvtColor(frame2, cv2.COLOR_BGR2RGB))
-                if rects2:
-                    emb2 = get_face_embedding(cv2.cvtColor(frame2, cv2.COLOR_BGR2RGB), rects2[0])
-                    emb_avg = (emb1 + emb2) / 2
-                    register_face(name, emb_avg)
-                else:
-                    print("[WARNING] Không phát hiện mặt có khẩu trang.")
+            # Kiểm tra phím nhấn
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('r'):
+                name = input("Nhập tên để đăng ký: ")
+                save_path = os.path.join(EMBED_DIR, f"{name}.npy")
+                np.save(save_path, embedding)
+                print(f"Đã lưu khuôn mặt của {name}")
             else:
-                print("[WARNING] Không phát hiện khuôn mặt.")
+                name = recognize(embedding)
+                cv2.putText(frame_out, name, (30, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.2,
+                            (0, 255, 0) if name != "Unknown" else (0, 0, 255), 2)
+
+    else:
+        cv2.putText(frame_out, "Không thấy khuôn mặt", (30, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+
+    cv2.imshow("Face Recognition", frame_out)
+
+    if cv2.waitKey(1) & 0xFF == 27:
+        break
 
 cap.release()
 cv2.destroyAllWindows()

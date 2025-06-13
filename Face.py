@@ -1,183 +1,180 @@
 import cv2
+import dlib
 import numpy as np
 import os
-from itertools import combinations
-import random
 import mediapipe as mp
+from sklearn.metrics.pairwise import cosine_similarity
 
-DB_FILE = "face_db.npz"
-embeddings = []
-labels = []
-THRESHOLD = 0.8
+# === Cấu hình ===
+EMBEDDING_DIR = "embeddings"
+os.makedirs(EMBEDDING_DIR, exist_ok=True)
 
-mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(static_image_mode=False, max_num_faces=1, refine_landmarks=True, min_detection_confidence=0.5)
+detector = dlib.get_frontal_face_detector()
+predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
+face_rec_model = dlib.face_recognition_model_v1("dlib_face_recognition_resnet_model_v1.dat")
 
-LANDMARK_INDEXES = list(range(468))
+mp_face_detection = mp.solutions.face_detection
+face_detection = mp_face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.6)
 
-if os.path.exists(DB_FILE):
-    data = np.load(DB_FILE, allow_pickle=True)
-    embeddings = list(data["embeddings"])
-    labels = list(data["labels"])
-
-def suggest_optimal_threshold():
-    global THRESHOLD
-    if len(embeddings) < 2:
-        return
-
-    same_dists = []
-    diff_dists = []
-
-    for (i1, emb1), (i2, emb2) in combinations(enumerate(embeddings), 2):
-        dist = np.linalg.norm(emb1 - emb2)
-        if labels[i1] == labels[i2]:
-            same_dists.append(dist)
-        else:
-            diff_dists.append(dist)
-
-    if not diff_dists:
-        return
-
-    thresholds = np.linspace(0.2, 2.0, 250)
-    best_threshold = 0.8
-    best_acc = 0
-
-    for t in thresholds:
-        tp = np.sum(np.array(same_dists) <= t)
-        fn = np.sum(np.array(same_dists) > t)
-        tn = np.sum(np.array(diff_dists) > t)
-        fp = np.sum(np.array(diff_dists) <= t)
-        acc = (tp + tn) / (tp + tn + fp + fn)
-        if acc > best_acc:
-            best_acc = acc
-            best_threshold = t
-
-    THRESHOLD = best_threshold
-
-def compare_embeddings(embedding1, embedding2):
-    dist = np.linalg.norm(embedding1 - embedding2)
-    return dist, dist < THRESHOLD
-
-def save_db():
-    np.savez(DB_FILE, embeddings=embeddings, labels=labels)
-
-def compute_embedding(image):
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    results = face_mesh.process(image_rgb)
-    if not results.multi_face_landmarks:
+# === Hàm xử lý ===
+def get_face_embedding_full(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    dets = detector(gray, 1)
+    if len(dets) == 0:
         return None
+    shape = predictor(gray, dets[0])
+    return np.array(face_rec_model.compute_face_descriptor(img, shape))
 
-    face_landmarks = results.multi_face_landmarks[0]
-    h, w, _ = image.shape
-    points = []
-    for idx in LANDMARK_INDEXES:
-        lm = face_landmarks.landmark[idx]
-        points.extend([lm.x, lm.y, lm.z])
+def get_face_embedding_partial(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    dets = detector(gray, 1)
+    if len(dets) == 0:
+        return None
+    shape = predictor(gray, dets[0])
+    landmarks = np.array([[p.x, p.y] for p in shape.parts()])
 
-    return np.array(points)
+    top = min(landmarks[17:27, 1]) - 20
+    bottom = max(landmarks[36:48, 1]) + 10
+    left = min(landmarks[0:17, 0])
+    right = max(landmarks[0:17, 0])
+    h, w, _ = img.shape
+    top, bottom = max(0, top), min(h, bottom)
+    left, right = max(0, left), min(w, right)
 
-def register_multi_pose(cap):
-    required_poses = ["frontal"]
+    cropped = img[top:bottom, left:right]
+    if cropped.size == 0:
+        return None
+    resized = cv2.resize(cropped, (150, 150))
+    rect = dlib.rectangle(0, 0, 149, 149)
+    shape = predictor(cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY), rect)
+    return np.array(face_rec_model.compute_face_descriptor(resized, shape))
 
-    captured_embeddings = []
-    name = input("Nhap ten nguoi dung: ").strip()
-    if not name:
-        print("[-] Ten khong hop le.")
-        return
-    if name in labels:
-        print("[!] Ten da ton tai.")
-        return
+def save_embedding(name, embedding, masked=False):
+    suffix = "masked" if masked else "normal"
+    np.save(os.path.join(EMBEDDING_DIR, f"{name}_{suffix}.npy"), embedding)
 
-    print("[*] Huong dan nguoi dung thuc hien tung goc...")
-    for pose in required_poses:
-        print(f"[{pose.upper()}] Nhin thang vao camera")
-        pose_captured = False
+def load_embeddings():
+    embeddings = {}
+    for file in os.listdir(EMBEDDING_DIR):
+        if file.endswith(".npy"):
+            parts = file[:-4].split("_")
+            if len(parts) == 2:
+                name, mode = parts
+                emb = np.load(os.path.join(EMBEDDING_DIR, file))
+                embeddings[f"{name}_{mode}"] = emb
+    return embeddings
 
-        while not pose_captured:
-            ret, frame = cap.read()
-            if not ret:
-                break
+def verify_face(embedding, known_embeddings, masked=False, threshold=0.6):
+    target_suffix = "masked" if masked else "normal"
+    for key, emb in known_embeddings.items():
+        if key.endswith(target_suffix):
+            sim = cosine_similarity([embedding], [emb])[0][0]
+            if sim > threshold:
+                return key.replace(f"_{target_suffix}", ""), sim
+    return "Unknown", 0.0
 
-            emb = compute_embedding(frame)
-            if emb is not None:
-                cv2.putText(frame, "Nhan 'c' de chup", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-                cv2.imshow("Dang ky", frame)
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('c'):
-                    for saved_emb in embeddings:
-                        if np.linalg.norm(emb - saved_emb) < THRESHOLD:
-                            print("[!] Khuon mat da ton tai trong he thong.")
-                            cv2.destroyWindow("Dang ky")
-                            return
-                    captured_embeddings.append(emb)
-                    print(f"[+] Da chup goc {pose}")
-                    pose_captured = True
-            else:
-                cv2.putText(frame, "Khong tim thay khuon mat", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                cv2.imshow("Dang ky", frame)
-                cv2.waitKey(1)
+# === Chương trình chính ===
+mode = input("Chọn chế độ [register / verify]: ").strip().lower()
+cap = cv2.VideoCapture(0)
 
-    if len(captured_embeddings) == len(required_poses):
-        avg_embedding = np.mean(captured_embeddings, axis=0)
-        embeddings.append(avg_embedding)
-        labels.append(name)
-        save_db()
-        print(f"[+] Dang ky hoan tat cho {name}")
-    else:
-        print("[!] Dang ky chua hoan tat.")
-
-    cv2.destroyWindow("Dang ky")
-
-def verify_faces_on_frame(frame):
-    emb = compute_embedding(frame)
-    if emb is None:
-        return
-
-    matched_name = "Unknown"
-    max_score = 0.0
-
-    for name, reg_emb in zip(labels, embeddings):
-        dist, matched = compare_embeddings(reg_emb, emb)
-        score = max(0, 1 - dist / THRESHOLD) * 100
-        if matched and score > max_score:
-            matched_name = name
-            max_score = score
-
-    h, w = frame.shape[:2]
-    cv2.putText(frame, f"{matched_name} ({max_score:.2f}%)", (10, h - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-def main():
-    stream_url = "https://3945-2402-800-6106-e118-ec93-b42a-93f3-6d7b.ngrok-free.app/video_feed"
-    cap = cv2.VideoCapture(stream_url)
-
-    if not cap.isOpened():
-        print("[-] Khong the ket noi den stream MJPEG.")
-        return
+if mode == "register":
+    name = input("Nhập tên: ").strip()
+    print("[1/2] Đưa mặt vào khung (KHÔNG đeo khẩu trang)...")
 
     while True:
         ret, frame = cap.read()
-        if not ret or frame is None:
-            print("[-] Loi doc frame tu stream.")
+        if not ret:
             continue
+        image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = face_detection.process(image_rgb)
 
-        verify_faces_on_frame(frame)
+        if results.detections:
+            bbox = results.detections[0].location_data.relative_bounding_box
+            h, w, _ = frame.shape
+            x1 = int(bbox.xmin * w)
+            y1 = int(bbox.ymin * h)
+            x2 = int((bbox.xmin + bbox.width) * w)
+            y2 = int((bbox.ymin + bbox.height) * h)
+            face_img = frame[y1:y2, x1:x2]
 
-        cv2.putText(frame, "'v': Xac thuc | 'r': Dang ky | 'q': Thoat", (10, 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-
-        key = cv2.waitKey(1) & 0xFF
-
-        if key == ord('r'):
-            register_multi_pose(cap)
-        if key == ord('q'):
+            emb = get_face_embedding_full(face_img)
+            if emb is not None:
+                save_embedding(name, emb, masked=False)
+                print("[✔] Đã lưu khuôn mặt không đeo khẩu trang.")
+                break
+        cv2.imshow("Đăng ký KHÔNG khẩu trang", frame)
+        if cv2.waitKey(1) & 0xFF == 27:
             break
 
-        cv2.imshow("Nhan dien khuon mat", frame)
+    input("➡️ Đeo khẩu trang rồi nhấn Enter để tiếp tục...")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = face_detection.process(image_rgb)
+
+        if results.detections:
+            bbox = results.detections[0].location_data.relative_bounding_box
+            h, w, _ = frame.shape
+            x1 = int(bbox.xmin * w)
+            y1 = int(bbox.ymin * h)
+            x2 = int((bbox.xmin + bbox.width) * w)
+            y2 = int((bbox.ymin + bbox.height) * h)
+            face_img = frame[y1:y2, x1:x2]
+
+            emb = get_face_embedding_partial(face_img)
+            if emb is not None:
+                save_embedding(name, emb, masked=True)
+                print("[✔] Đã lưu khuôn mặt ĐEO khẩu trang.")
+                break
+        cv2.imshow("Đăng ký CÓ khẩu trang", frame)
+        if cv2.waitKey(1) & 0xFF == 27:
+            break
 
     cap.release()
     cv2.destroyAllWindows()
 
-if __name__ == "__main__":
-    main()
+elif mode == "verify":
+    known_embeddings = load_embeddings()
+    print("📷 Đưa mặt vào khung (có thể đeo khẩu trang)...")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = face_detection.process(image_rgb)
+
+        if results.detections:
+            for detection in results.detections:
+                bbox = detection.location_data.relative_bounding_box
+                h, w, _ = frame.shape
+                x1 = int(bbox.xmin * w)
+                y1 = int(bbox.ymin * h)
+                x2 = int((bbox.xmin + bbox.width) * w)
+                y2 = int((bbox.ymin + bbox.height) * h)
+                face_img = frame[y1:y2, x1:x2]
+
+                emb = get_face_embedding_partial(face_img)
+                name, sim = verify_face(emb, known_embeddings, masked=True)
+                if name == "Unknown":
+                    emb = get_face_embedding_full(face_img)
+                    name, sim = verify_face(emb, known_embeddings, masked=False)
+
+                label = f"{name} ({sim:.2f})" if name != "Unknown" else name
+                color = (0, 255, 0) if name != "Unknown" else (0, 0, 255)
+                cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+        cv2.imshow("Xác thực khuôn mặt", frame)
+        if cv2.waitKey(1) & 0xFF == 27:
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+else:
+    print("❌ Chế độ không hợp lệ. Dùng 'register' hoặc 'verify'")
+    cap.release()

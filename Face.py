@@ -25,20 +25,6 @@ LANDMARK_68_INDEXES = [
     172, 58, 132, 93, 234, 127, 162, 21
 ][:68]  # Ensure 68 points
 
-class FakeFullObjectDetection:
-    def __init__(self, rect, points):
-        self._rect = rect
-        self._points = points
-
-    def num_parts(self):
-        return len(self._points)
-
-    def part(self, idx):
-        return self._points[idx]
-
-    def rect(self):
-        return self._rect
-
 DB_FILE = "face_db.npz"
 embeddings = []
 labels = []
@@ -114,8 +100,7 @@ def compute_embedding(image, face_rect):
     if len(points) != 68:
         return None
 
-    shape = FakeFullObjectDetection(face_rect, points)
-    return np.array(face_encoder.compute_face_descriptor(image, shape))
+    return np.array(face_encoder.compute_face_descriptor(image, points, 1))
 
 def is_face_centered(face_rect, frame_shape, threshold_ratio=0.2):
     face_center_x = (face_rect.left() + face_rect.right()) // 2

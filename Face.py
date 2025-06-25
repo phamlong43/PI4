@@ -1,288 +1,261 @@
-import sys
-import cv2
-import numpy as np
-from PyQt5.QtWidgets import (
-    QApplication, QLabel, QPushButton, QFileDialog, QVBoxLayout, QWidget, QTextEdit, QHBoxLayout
-)
-from PyQt5.QtGui import QPixmap, QImage
-from PyQt5.QtCore import QTimer
-import tensorflow as tf
-from tensorflow.keras.models import load_model
-import keras.layers as layers
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/device.h>
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/uaccess.h>
+#include <linux/string.h>
+#include <linux/slab.h>  // for kmalloc and kfree
 
-# Custom Conv2D cho các model đã huấn luyện
-class StandardizedConv2DWithOverride1(layers.Conv2D):
-    def convolution_op(self, inputs, kernel):
-        mean, var = tf.nn.moments(kernel, axes=[0, 1, 2], keepdims=True)
-        return tf.nn.conv2d((inputs), (kernel - mean) / tf.sqrt(var + 1e-10),
-                            padding="VALID", strides=list(self.strides))
+#define DEVICE_NAME "lab6"
+#define CLASS_NAME "crypto"
+#define BUFFER_SIZE 1024
 
-class StandardizedConv2DModel2(layers.Conv2D):
-    def convolution_op(self, inputs, kernel):
-        mean, var = tf.nn.moments(kernel, axes=[0, 1, 2], keepdims=True)
-        standardized_kernel = (kernel - mean) / tf.sqrt(var + 1e-10)
-        return tf.nn.conv2d(inputs, standardized_kernel,
-                            padding=self.padding.upper(), strides=list(self.strides))
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Your Name");
+MODULE_DESCRIPTION("Cryptographic Character Driver using ioctl");
+MODULE_VERSION("1.0");
 
-# Load model AI
-emotion_model = load_model('emotion.hdf5',
-                           custom_objects={'StandardizedConv2DWithOverride': StandardizedConv2DWithOverride1})
-stress_model = load_model('model.h5',
-                          custom_objects={'StandardizedConv2DWithOverride': StandardizedConv2DModel2})
+static int major_number;
+static char message[BUFFER_SIZE] = {0};
+static char encrypted[BUFFER_SIZE] = {0};
+static struct class* crypto_class = NULL;
+static struct device* crypto_device = NULL;
 
-emotion_classes = ['surprise', 'fear', 'sadness', 'disgust', 'contempt', 'happy', 'anger']
-stress_classes = ['relaxed', 'stress']
+// IOCTL commands
+#define CRYPTO_IOC_MAGIC 'c'
+#define CRYPTO_SHIFT_ENCRYPT         _IOW(CRYPTO_IOC_MAGIC, 1, int)
+#define CRYPTO_SHIFT_DECRYPT         _IOW(CRYPTO_IOC_MAGIC, 2, int)
+#define CRYPTO_SUBSTITUTION_ENCRYPT _IO(CRYPTO_IOC_MAGIC, 3)
+#define CRYPTO_SUBSTITUTION_DECRYPT _IO(CRYPTO_IOC_MAGIC, 4)
+#define CRYPTO_TRANSPOSITION_ENCRYPT _IOW(CRYPTO_IOC_MAGIC, 5, int)
+#define CRYPTO_TRANSPOSITION_DECRYPT _IOW(CRYPTO_IOC_MAGIC, 6, int)
 
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+// =========================
+// === Cipher Functions ===
+// =========================
 
-def preprocess_face(face_img, target_size=(48, 48)):
-    face_resized = cv2.resize(face_img, target_size)
-    face_gray = cv2.cvtColor(face_resized, cv2.COLOR_BGR2GRAY)
-    img_array = face_gray.astype('float32') / 255.0
-    img_array = np.expand_dims(img_array, axis=-1)
-    img_array = np.repeat(img_array, 3, axis=2)
-    img_array = np.expand_dims(img_array, axis=0)
-    return img_array
+static void shift_encrypt(char* text, int shift) {
+    int i;
+    shift %= 26;
+    for (i = 0; text[i]; i++) {
+        if (text[i] >= 'a' && text[i] <= 'z')
+            text[i] = ((text[i] - 'a' + shift) % 26) + 'a';
+        else if (text[i] >= 'A' && text[i] <= 'Z')
+            text[i] = ((text[i] - 'A' + shift) % 26) + 'A';
+    }
+}
 
-class StressEmotionDetectionApp(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle('Nhận diện Stress và Cảm xúc')
-        self.apply_styles()
+static void shift_decrypt(char* text, int shift) {
+    shift_encrypt(text, 26 - (shift % 26));
+}
 
-        # Layout chính
-        self.image_label = QLabel()
-        self.face_label = QLabel()
-        self.image_label.setFixedSize(320, 240)
-        self.face_label.setFixedSize(160, 160)
-        self.image_label.setStyleSheet("border: 1px solid #aaa;")
-        self.face_label.setStyleSheet("border: 1px solid #aaa;")
+static const char sub_key[27] = "zyxwvutsrqponmlkjihgfedcba";
 
-        images_layout = QHBoxLayout()
-        images_layout.addWidget(self.image_label)
-        images_layout.addWidget(self.face_label)
+static void substitution_encrypt(char* text) {
+    int i;
+    for (i = 0; text[i]; i++) {
+        if (text[i] >= 'a' && text[i] <= 'z')
+            text[i] = sub_key[text[i] - 'a'];
+        else if (text[i] >= 'A' && text[i] <= 'Z')
+            text[i] = sub_key[text[i] - 'A'] - 32;
+    }
+}
 
-        self.result_text = QTextEdit()
-        self.result_text.setReadOnly(True)
-
-        self.select_btn = QPushButton('Chọn ảnh')
-        self.open_cam_btn = QPushButton('Mở camera')
-        self.capture_btn = QPushButton('Chụp ảnh')
-        self.capture_btn.setEnabled(False)
-        self.detect_emotion_btn = QPushButton('Nhận diện cảm xúc')
-        self.detect_stress_btn = QPushButton('Nhận diện stress')
-        self.quit_btn = QPushButton('Thoát')
-
-        # Đặt ObjectName để áp dụng CSS riêng
-        self.detect_stress_btn.setObjectName("stressBtn")
-        self.detect_emotion_btn.setObjectName("emotionBtn")
-        self.quit_btn.setObjectName("quitBtn")
-
-        self.select_btn.clicked.connect(self.load_image)
-        self.open_cam_btn.clicked.connect(self.open_camera)
-        self.capture_btn.clicked.connect(self.capture_image)
-        self.detect_emotion_btn.clicked.connect(self.detect_emotion)
-        self.detect_stress_btn.clicked.connect(self.detect_stress)
-        self.quit_btn.clicked.connect(self.close)
-
-        buttons_layout = QHBoxLayout()
-        buttons_layout.addWidget(self.select_btn)
-        buttons_layout.addWidget(self.open_cam_btn)
-        buttons_layout.addWidget(self.capture_btn)
-        buttons_layout.addWidget(self.detect_emotion_btn)
-        buttons_layout.addWidget(self.detect_stress_btn)
-        buttons_layout.addWidget(self.quit_btn)
-
-        main_layout = QVBoxLayout()
-        main_layout.addLayout(images_layout)
-        main_layout.addWidget(self.result_text)
-        main_layout.addLayout(buttons_layout)
-        main_layout.setSpacing(12)
-        main_layout.setContentsMargins(12, 12, 12, 12)
-        self.setLayout(main_layout)
-
-        self.image = None
-        self.cap = None
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.update_frame)
-
-    def apply_styles(self):
-        self.setStyleSheet("""
-            QWidget {
-                background-color: #f4f6f8;
-                font-family: Arial;
-                font-size: 14px;
+static void substitution_decrypt(char* text) {
+    int i, j;
+    for (i = 0; text[i]; i++) {
+        if (text[i] >= 'a' && text[i] <= 'z') {
+            for (j = 0; j < 26; j++) {
+                if (sub_key[j] == text[i]) {
+                    text[i] = 'a' + j;
+                    break;
+                }
             }
-            QPushButton {
-                background-color: #4CAF50;
-                color: white;
-                padding: 8px 14px;
-                border-radius: 4px;
+        } else if (text[i] >= 'A' && text[i] <= 'Z') {
+            char lower = text[i] + 32;
+            for (j = 0; j < 26; j++) {
+                if (sub_key[j] == lower) {
+                    text[i] = 'A' + j;
+                    break;
+                }
             }
-            QPushButton:hover {
-                background-color: #45a049;
+        }
+    }
+}
+
+static void transposition_encrypt(char* text, int key) {
+    int len = strlen(text);
+    if (len == 0 || key <= 1) return;
+
+    int rows = (len + key - 1) / key;
+    char *temp = kmalloc(len + 1, GFP_KERNEL);
+    int i, j, idx = 0;
+    if (!temp) return;
+
+    for (j = 0; j < key; j++) {
+        for (i = 0; i < rows; i++) {
+            int pos = i * key + j;
+            if (pos < len) {
+                temp[idx++] = text[pos];
             }
-            QPushButton#stressBtn {
-                background-color: #f44336;
+        }
+    }
+
+    temp[len] = '\0';
+    strscpy(text, temp, len + 1);
+    kfree(temp);
+}
+
+static void transposition_decrypt(char* text, int key) {
+    int len = strlen(text);
+    if (len == 0 || key <= 1) return;
+
+    int rows = (len + key - 1) / key;
+    char *temp = kmalloc(len + 1, GFP_KERNEL);
+    int full_columns = len % key;
+    int i, j, idx = 0;
+
+    if (!temp) return;
+    if (full_columns == 0) full_columns = key;
+
+    for (j = 0; j < key; j++) {
+        int col_size = (j < full_columns) ? rows : rows - 1;
+        for (i = 0; i < col_size; i++) {
+            int pos = i * key + j;
+            if (pos < len && idx < len) {
+                temp[pos] = text[idx++];
             }
-            QPushButton#stressBtn:hover {
-                background-color: #e53935;
-            }
-            QPushButton#emotionBtn {
-                background-color: #2196F3;
-            }
-            QPushButton#emotionBtn:hover {
-                background-color: #1976D2;
-            }
-            QPushButton#quitBtn {
-                background-color: #9e9e9e;
-            }
-            QPushButton#quitBtn:hover {
-                background-color: #757575;
-            }
-            QTextEdit {
-                background-color: white;
-                border: 1px solid #ccc;
-                border-radius: 4px;
-                padding: 6px;
-            }
-            QLabel {
-                background-color: white;
-                border-radius: 4px;
-            }
-        """)
+        }
+    }
 
-    def load_image(self):
-        self.stop_camera()
-        file_path, _ = QFileDialog.getOpenFileName(self, "Chọn ảnh", "", "Images (*.png *.jpg *.jpeg)")
-        if file_path:
-            self.image = cv2.imread(file_path)
-            if self.image is not None:
-                qimg = self.convert_cv_to_qt(self.image, self.image_label.width(), self.image_label.height())
-                self.image_label.setPixmap(QPixmap.fromImage(qimg))
-                self.face_label.clear()
-                self.result_text.setText(f"Đã chọn ảnh:\n{file_path}")
+    temp[len] = '\0';
+    strscpy(text, temp, len + 1);
+    kfree(temp);
+}
 
-    def open_camera(self):
-        if self.cap is None:
-            self.cap = cv2.VideoCapture(0)
-            if not self.cap.isOpened():
-                self.result_text.setText("Không thể mở camera.")
-                self.cap = None
-                return
-            self.timer.start(30)
-            self.open_cam_btn.setText("Tắt camera")
-            self.capture_btn.setEnabled(True)
-            self.result_text.setText("Đang mở camera. Nhấn 'Chụp ảnh' để nhận diện.")
-        else:
-            self.stop_camera()
+// =========================
+// === File Operations  ===
+// =========================
 
-    def stop_camera(self):
-        self.timer.stop()
-        if self.cap:
-            self.cap.release()
-            self.cap = None
-        self.open_cam_btn.setText("Mở camera")
-        self.capture_btn.setEnabled(False)
+static int dev_open(struct inode *inodep, struct file *filep) {
+    printk(KERN_INFO "Crypto: Device opened\n");
+    return 0;
+}
 
-    def update_frame(self):
-        ret, frame = self.cap.read()
-        if not ret:
-            self.result_text.setText("Lỗi khi lấy hình từ camera.")
-            self.stop_camera()
-            return
-        self.image = frame
-        qimg = self.convert_cv_to_qt(frame, self.image_label.width(), self.image_label.height())
-        self.image_label.setPixmap(QPixmap.fromImage(qimg))
-        self.face_label.clear()
+static int dev_release(struct inode *inodep, struct file *filep) {
+    printk(KERN_INFO "Crypto: Device closed\n");
+    return 0;
+}
 
-    def capture_image(self):
-        if self.image is None:
-            self.result_text.setText("Chưa có ảnh để chụp.")
-            return
-        self.stop_camera()
-        self.result_text.setText("Ảnh đã được chụp. Nhấn 'Nhận diện' để dự đoán.")
-        qimg = self.convert_cv_to_qt(self.image, self.image_label.width(), self.image_label.height())
-        self.image_label.setPixmap(QPixmap.fromImage(qimg))
-        self.face_label.clear()
+static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *offset) {
+    size_t msg_len = strlen(encrypted);
+    size_t remaining = msg_len - *offset;
+    size_t to_copy = (len < remaining) ? len : remaining;
 
-    def detect_face(self):
-        if self.image is None:
-            self.result_text.setText("Vui lòng chọn ảnh hoặc chụp ảnh trước.")
-            return None
-        gray = cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.1, 5)
-        if len(faces) == 0:
-            self.result_text.setText("Không tìm thấy khuôn mặt.")
-            self.face_label.clear()
-            return None
-        x, y, w, h = faces[0]
-        face_img = self.image[y:y + h, x:x + w]
-        qimg_face = self.convert_cv_to_qt(face_img, self.face_label.width(), self.face_label.height())
-        self.face_label.setPixmap(QPixmap.fromImage(qimg_face))
-        return preprocess_face(face_img)
+    if (*offset >= msg_len)
+        return 0;
 
-    def detect_emotion(self):
-        img_array = self.detect_face()
-        if img_array is None:
-            return
-        try:
-            preds = emotion_model.predict(img_array)
-            idx = np.argmax(preds, axis=1)[0]
-            emotion_result = emotion_classes[idx]
-            result = f"Cảm xúc chính: {emotion_result}"
-            self.result_text.setText(result)
-        except Exception as e:
-            self.result_text.setText(f"Lỗi khi dự đoán cảm xúc: {str(e)}")
+    if (copy_to_user(buffer, encrypted + *offset, to_copy))
+        return -EFAULT;
 
-    def detect_stress(self):
-        img_array = self.detect_face()
-        if img_array is None:
-            return
-        try:
-            preds_stress = stress_model.predict(img_array)
-            stress_prob = preds_stress[0][1]
-            stress_result = stress_classes[np.argmax(preds_stress, axis=1)[0]]
+    *offset += to_copy;
+    return to_copy;
+}
 
-            preds_emotion = emotion_model.predict(img_array)
-            idx_emotion = np.argmax(preds_emotion, axis=1)[0]
-            emotion_result = emotion_classes[idx_emotion]
-            emotion_prob = preds_emotion[0][idx_emotion]
+static ssize_t dev_write(struct file *filep, const char *buffer, size_t len, loff_t *offset) {
+    if (len >= BUFFER_SIZE)
+        len = BUFFER_SIZE - 1;
 
-            positive_emotions = ['happy', 'surprise']
-            negative_emotions = ['fear', 'sadness', 'disgust', 'contempt', 'anger']
+    if (copy_from_user(message, buffer, len))
+        return -EFAULT;
 
-            avg_prob = ((stress_prob + emotion_prob) / 2) * 100
+    message[len] = '\0';
+    strcpy(encrypted, message);
 
-            if stress_result == 'stress':
-                if emotion_result in negative_emotions:
-                    severity = f"Stress nặng ({avg_prob:.2f}%)"
-                else:
-                    severity = f"Stress nhẹ ({avg_prob:.2f}%)"
-            else:
-                severity = "Không stress"
+    *offset = 0;
+    filep->f_pos = 0;
+    return len;
+}
 
-            result = f"Kết quả stress:\nRelaxed: {preds_stress[0][0] * 100:.2f}%\nStress: {stress_prob * 100:.2f}%\n"
-            result += f"\n--> Tình trạng stress: {severity}\n"
-            result += f"--> Cảm xúc chính: {emotion_result} ({emotion_prob * 100:.2f}%)"
-            self.result_text.setText(result)
-        except Exception as e:
-            self.result_text.setText(f"Lỗi khi dự đoán stress: {str(e)}")
+static long dev_ioctl(struct file *filep, unsigned int cmd, unsigned long arg) {
+    int key;
+    strscpy(encrypted, message, BUFFER_SIZE);
 
-    def convert_cv_to_qt(self, cv_img, width=None, height=None):
-        rgb_image = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
-        if width and height:
-            rgb_image = cv2.resize(rgb_image, (width, height), interpolation=cv2.INTER_AREA)
-        h, w, ch = rgb_image.shape
-        bytes_per_line = ch * w
-        return QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+    switch (cmd) {
+        case CRYPTO_SHIFT_ENCRYPT:
+            if (copy_from_user(&key, (int *)arg, sizeof(int))) return -EFAULT;
+            shift_encrypt(encrypted, key);
+            break;
+        case CRYPTO_SHIFT_DECRYPT:
+            if (copy_from_user(&key, (int *)arg, sizeof(int))) return -EFAULT;
+            shift_decrypt(encrypted, key);
+            break;
+        case CRYPTO_SUBSTITUTION_ENCRYPT:
+            substitution_encrypt(encrypted);
+            break;
+        case CRYPTO_SUBSTITUTION_DECRYPT:
+            substitution_decrypt(encrypted);
+            break;
+        case CRYPTO_TRANSPOSITION_ENCRYPT:
+            if (copy_from_user(&key, (int *)arg, sizeof(int))) return -EFAULT;
+            transposition_encrypt(encrypted, key);
+            break;
+        case CRYPTO_TRANSPOSITION_DECRYPT:
+            if (copy_from_user(&key, (int *)arg, sizeof(int))) return -EFAULT;
+            transposition_decrypt(encrypted, key);
+            break;
+        default:
+            return -EINVAL;
+    }
 
-    def closeEvent(self, event):
-        self.stop_camera()
-        event.accept()
+    filep->f_pos = 0;
+    return 0;
+}
 
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    window = StressEmotionDetectionApp()
-    window.show()
-    sys.exit(app.exec_())
+static struct file_operations fops = {
+    .open = dev_open,
+    .read = dev_read,
+    .write = dev_write,
+    .release = dev_release,
+    .unlocked_ioctl = dev_ioctl,
+};
+
+// ==============================
+// === Module Init / Exit ======
+// ==============================
+
+static int __init crypto_init(void) {
+    printk(KERN_INFO "Crypto: Initializing module...\n");
+
+    major_number = register_chrdev(0, DEVICE_NAME, &fops);
+    if (major_number < 0)
+        return major_number;
+
+    crypto_class = class_create(CLASS_NAME);
+    if (IS_ERR(crypto_class)) {
+        unregister_chrdev(major_number, DEVICE_NAME);
+        return PTR_ERR(crypto_class);
+    }
+
+    crypto_device = device_create(crypto_class, NULL, MKDEV(major_number, 0), NULL, DEVICE_NAME);
+    if (IS_ERR(crypto_device)) {
+        class_destroy(crypto_class);
+        unregister_chrdev(major_number, DEVICE_NAME);
+        return PTR_ERR(crypto_device);
+    }
+
+    printk(KERN_INFO "Crypto: Device created successfully (major %d)\n", major_number);
+    return 0;
+}
+
+static void __exit crypto_exit(void) {
+    device_destroy(crypto_class, MKDEV(major_number, 0));
+    class_unregister(crypto_class);
+    class_destroy(crypto_class);
+    unregister_chrdev(major_number, DEVICE_NAME);
+    printk(KERN_INFO "Crypto: Module unloaded\n");
+}
+
+module_init(crypto_init);
+module_exit(crypto_exit);

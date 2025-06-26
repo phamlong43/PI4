@@ -1,261 +1,173 @@
-#include <linux/init.h>
-#include <linux/module.h>
-#include <linux/device.h>
-#include <linux/kernel.h>
-#include <linux/fs.h>
-#include <linux/uaccess.h>
-#include <linux/string.h>
-#include <linux/slab.h>  // for kmalloc and kfree
+import time
+import board
+from digitalio import DigitalInOut, Direction
+import adafruit_fingerprint
+import serial 
 
-#define DEVICE_NAME "lab6"
-#define CLASS_NAME "crypto"
-#define BUFFER_SIZE 1024
+led = DigitalInOut(board.D13)
+led.direction = Direction.OUTPUT
 
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Your Name");
-MODULE_DESCRIPTION("Cryptographic Character Driver using ioctl");
-MODULE_VERSION("1.0");
+uart = serial.Serial("/dev/ttyS0", baudrate=57600, timeout=1)
 
-static int major_number;
-static char message[BUFFER_SIZE] = {0};
-static char encrypted[BUFFER_SIZE] = {0};
-static struct class* crypto_class = NULL;
-static struct device* crypto_device = NULL;
+finger = adafruit_fingerprint.Adafruit_Fingerprint(uart)
 
-// IOCTL commands
-#define CRYPTO_IOC_MAGIC 'c'
-#define CRYPTO_SHIFT_ENCRYPT         _IOW(CRYPTO_IOC_MAGIC, 1, int)
-#define CRYPTO_SHIFT_DECRYPT         _IOW(CRYPTO_IOC_MAGIC, 2, int)
-#define CRYPTO_SUBSTITUTION_ENCRYPT _IO(CRYPTO_IOC_MAGIC, 3)
-#define CRYPTO_SUBSTITUTION_DECRYPT _IO(CRYPTO_IOC_MAGIC, 4)
-#define CRYPTO_TRANSPOSITION_ENCRYPT _IOW(CRYPTO_IOC_MAGIC, 5, int)
-#define CRYPTO_TRANSPOSITION_DECRYPT _IOW(CRYPTO_IOC_MAGIC, 6, int)
 
-// =========================
-// === Cipher Functions ===
-// =========================
+def get_fingerprint():
+    """Get a fingerprint image, template it, and see if it matches!"""
+    print("Waiting for image...")
+    while finger.get_image() != adafruit_fingerprint.OK:
+        pass
+    print("Templating...")
+    if finger.image_2_tz(1) != adafruit_fingerprint.OK:
+        return False
+    print("Searching...")
+    if finger.finger_search() != adafruit_fingerprint.OK:
+        return False
+    return True
 
-static void shift_encrypt(char* text, int shift) {
-    int i;
-    shift %= 26;
-    for (i = 0; text[i]; i++) {
-        if (text[i] >= 'a' && text[i] <= 'z')
-            text[i] = ((text[i] - 'a' + shift) % 26) + 'a';
-        else if (text[i] >= 'A' && text[i] <= 'Z')
-            text[i] = ((text[i] - 'A' + shift) % 26) + 'A';
-    }
-}
+def get_fingerprint_detail():
+    """Get a fingerprint image, template it, and see if it matches!
+    This time, print out each error instead of just returning on failure"""
+    print("Getting image...", end="")
+    i = finger.get_image()
+    if i == adafruit_fingerprint.OK:
+        print("Image taken")
+    else:
+        if i == adafruit_fingerprint.NOFINGER:
+            print("No finger detected")
+        elif i == adafruit_fingerprint.IMAGEFAIL:
+            print("Imaging error")
+        else:
+            print("Other error")
+        return False
 
-static void shift_decrypt(char* text, int shift) {
-    shift_encrypt(text, 26 - (shift % 26));
-}
+    print("Templating...", end="")
+    i = finger.image_2_tz(1)
+    if i == adafruit_fingerprint.OK:
+        print("Templated")
+    else:
+        if i == adafruit_fingerprint.IMAGEMESS:
+            print("Image too messy")
+        elif i == adafruit_fingerprint.FEATUREFAIL:
+            print("Could not identify features")
+        elif i == adafruit_fingerprint.INVALIDIMAGE:
+            print("Image invalid")
+        else:
+            print("Other error")
+        return False
 
-static const char sub_key[27] = "zyxwvutsrqponmlkjihgfedcba";
+    print("Searching...", end="")
+    i = finger.finger_fast_search()
+    if i == adafruit_fingerprint.OK:
+        print("Found fingerprint!")
+        return True
+    else:
+        if i == adafruit_fingerprint.NOTFOUND:
+            print("No match found")
+        else:
+            print("Other error")
+        return False
 
-static void substitution_encrypt(char* text) {
-    int i;
-    for (i = 0; text[i]; i++) {
-        if (text[i] >= 'a' && text[i] <= 'z')
-            text[i] = sub_key[text[i] - 'a'];
-        else if (text[i] >= 'A' && text[i] <= 'Z')
-            text[i] = sub_key[text[i] - 'A'] - 32;
-    }
-}
+def enroll_finger(location):
+    """Take 2 finger images and template them, then store in 'location'"""
+    for fingerimg in range(1, 3):
+        if fingerimg == 1:
+            print("Place finger on sensor...", end="")
+        else:
+            print("Place same finger again...", end="")
 
-static void substitution_decrypt(char* text) {
-    int i, j;
-    for (i = 0; text[i]; i++) {
-        if (text[i] >= 'a' && text[i] <= 'z') {
-            for (j = 0; j < 26; j++) {
-                if (sub_key[j] == text[i]) {
-                    text[i] = 'a' + j;
-                    break;
-                }
-            }
-        } else if (text[i] >= 'A' && text[i] <= 'Z') {
-            char lower = text[i] + 32;
-            for (j = 0; j < 26; j++) {
-                if (sub_key[j] == lower) {
-                    text[i] = 'A' + j;
-                    break;
-                }
-            }
-        }
-    }
-}
+        while True:
+            i = finger.get_image()
+            if i == adafruit_fingerprint.OK:
+                print("Image taken")
+                break
+            if i == adafruit_fingerprint.NOFINGER:
+                print(".", end="")
+            elif i == adafruit_fingerprint.IMAGEFAIL:
+                print("Imaging error")
+                return False
+            else:
+                print("Other error")
+                return False
 
-static void transposition_encrypt(char* text, int key) {
-    int len = strlen(text);
-    if (len == 0 || key <= 1) return;
+        print("Templating...", end="")
+        i = finger.image_2_tz(fingerimg)
+        if i == adafruit_fingerprint.OK:
+            print("Templated")
+        else:
+            if i == adafruit_fingerprint.IMAGEMESS:
+                print("Image too messy")
+            elif i == adafruit_fingerprint.FEATUREFAIL:
+                print("Could not identify features")
+            elif i == adafruit_fingerprint.INVALIDIMAGE:
+                print("Image invalid")
+            else:
+                print("Other error")
+            return False
 
-    int rows = (len + key - 1) / key;
-    char *temp = kmalloc(len + 1, GFP_KERNEL);
-    int i, j, idx = 0;
-    if (!temp) return;
+        if fingerimg == 1:
+            print("Remove finger")
+            time.sleep(1)
+            while i != adafruit_fingerprint.NOFINGER:
+                i = finger.get_image()
 
-    for (j = 0; j < key; j++) {
-        for (i = 0; i < rows; i++) {
-            int pos = i * key + j;
-            if (pos < len) {
-                temp[idx++] = text[pos];
-            }
-        }
-    }
+    print("Creating model...", end="")
+    i = finger.create_model()
+    if i == adafruit_fingerprint.OK:
+        print("Created")
+    else:
+        if i == adafruit_fingerprint.ENROLLMISMATCH:
+            print("Prints did not match")
+        else:
+            print("Other error")
+        return False
+    
 
-    temp[len] = '\0';
-    strscpy(text, temp, len + 1);
-    kfree(temp);
-}
+    print("Storing model #%d..." % location, end="")
+    i = finger.store_model(location)
+    if i == adafruit_fingerprint.OK:
+        print("Stored")
+    else:
+        if i == adafruit_fingerprint.BADLOCATION:
+            print("Bad storage location")
+        elif i == adafruit_fingerprint.FLASHERR:
+            print("Flash storage error")
+        else:
+            print("Other error")
+        return False
 
-static void transposition_decrypt(char* text, int key) {
-    int len = strlen(text);
-    if (len == 0 || key <= 1) return;
+    return True
 
-    int rows = (len + key - 1) / key;
-    char *temp = kmalloc(len + 1, GFP_KERNEL);
-    int full_columns = len % key;
-    int i, j, idx = 0;
+def get_num():
+    """Use input() to get a valid number from 1 to 127. Retry till success!"""
+    i = 0
+    while (i > 127) or (i < 1):
+        try:
+            i = int(input("Enter ID # from 1-127: "))
+        except ValueError:
+            pass
+    return i
 
-    if (!temp) return;
-    if (full_columns == 0) full_columns = key;
+while True:
+    print("----------------")
+    if finger.read_templates() != adafruit_fingerprint.OK:
+        raise RuntimeError("Failed to read templates")
+    print("Fingerprint templates:", finger.templates)
+    print("e) enroll print")
+    print("f) find print")
+    print("d) delete print")
+    print("----------------")
+    c = input("> ")
 
-    for (j = 0; j < key; j++) {
-        int col_size = (j < full_columns) ? rows : rows - 1;
-        for (i = 0; i < col_size; i++) {
-            int pos = i * key + j;
-            if (pos < len && idx < len) {
-                temp[pos] = text[idx++];
-            }
-        }
-    }
-
-    temp[len] = '\0';
-    strscpy(text, temp, len + 1);
-    kfree(temp);
-}
-
-// =========================
-// === File Operations  ===
-// =========================
-
-static int dev_open(struct inode *inodep, struct file *filep) {
-    printk(KERN_INFO "Crypto: Device opened\n");
-    return 0;
-}
-
-static int dev_release(struct inode *inodep, struct file *filep) {
-    printk(KERN_INFO "Crypto: Device closed\n");
-    return 0;
-}
-
-static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *offset) {
-    size_t msg_len = strlen(encrypted);
-    size_t remaining = msg_len - *offset;
-    size_t to_copy = (len < remaining) ? len : remaining;
-
-    if (*offset >= msg_len)
-        return 0;
-
-    if (copy_to_user(buffer, encrypted + *offset, to_copy))
-        return -EFAULT;
-
-    *offset += to_copy;
-    return to_copy;
-}
-
-static ssize_t dev_write(struct file *filep, const char *buffer, size_t len, loff_t *offset) {
-    if (len >= BUFFER_SIZE)
-        len = BUFFER_SIZE - 1;
-
-    if (copy_from_user(message, buffer, len))
-        return -EFAULT;
-
-    message[len] = '\0';
-    strcpy(encrypted, message);
-
-    *offset = 0;
-    filep->f_pos = 0;
-    return len;
-}
-
-static long dev_ioctl(struct file *filep, unsigned int cmd, unsigned long arg) {
-    int key;
-    strscpy(encrypted, message, BUFFER_SIZE);
-
-    switch (cmd) {
-        case CRYPTO_SHIFT_ENCRYPT:
-            if (copy_from_user(&key, (int *)arg, sizeof(int))) return -EFAULT;
-            shift_encrypt(encrypted, key);
-            break;
-        case CRYPTO_SHIFT_DECRYPT:
-            if (copy_from_user(&key, (int *)arg, sizeof(int))) return -EFAULT;
-            shift_decrypt(encrypted, key);
-            break;
-        case CRYPTO_SUBSTITUTION_ENCRYPT:
-            substitution_encrypt(encrypted);
-            break;
-        case CRYPTO_SUBSTITUTION_DECRYPT:
-            substitution_decrypt(encrypted);
-            break;
-        case CRYPTO_TRANSPOSITION_ENCRYPT:
-            if (copy_from_user(&key, (int *)arg, sizeof(int))) return -EFAULT;
-            transposition_encrypt(encrypted, key);
-            break;
-        case CRYPTO_TRANSPOSITION_DECRYPT:
-            if (copy_from_user(&key, (int *)arg, sizeof(int))) return -EFAULT;
-            transposition_decrypt(encrypted, key);
-            break;
-        default:
-            return -EINVAL;
-    }
-
-    filep->f_pos = 0;
-    return 0;
-}
-
-static struct file_operations fops = {
-    .open = dev_open,
-    .read = dev_read,
-    .write = dev_write,
-    .release = dev_release,
-    .unlocked_ioctl = dev_ioctl,
-};
-
-// ==============================
-// === Module Init / Exit ======
-// ==============================
-
-static int __init crypto_init(void) {
-    printk(KERN_INFO "Crypto: Initializing module...\n");
-
-    major_number = register_chrdev(0, DEVICE_NAME, &fops);
-    if (major_number < 0)
-        return major_number;
-
-    crypto_class = class_create(CLASS_NAME);
-    if (IS_ERR(crypto_class)) {
-        unregister_chrdev(major_number, DEVICE_NAME);
-        return PTR_ERR(crypto_class);
-    }
-
-    crypto_device = device_create(crypto_class, NULL, MKDEV(major_number, 0), NULL, DEVICE_NAME);
-    if (IS_ERR(crypto_device)) {
-        class_destroy(crypto_class);
-        unregister_chrdev(major_number, DEVICE_NAME);
-        return PTR_ERR(crypto_device);
-    }
-
-    printk(KERN_INFO "Crypto: Device created successfully (major %d)\n", major_number);
-    return 0;
-}
-
-static void __exit crypto_exit(void) {
-    device_destroy(crypto_class, MKDEV(major_number, 0));
-    class_unregister(crypto_class);
-    class_destroy(crypto_class);
-    unregister_chrdev(major_number, DEVICE_NAME);
-    printk(KERN_INFO "Crypto: Module unloaded\n");
-}
-
-module_init(crypto_init);
-module_exit(crypto_exit);
+    if c == "e":
+        enroll_finger(get_num())
+    if c == "f":
+        if get_fingerprint():
+            print("Detected #", finger.finger_id, "with confidence", finger.confidence)
+        else:
+            print("Finger not found")
+    if c == "d":
+        if finger.delete_model(get_num()) == adafruit_fingerprint.OK:
+            print("Deleted!")
+        else:
+            print("Failed to delete")

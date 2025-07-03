@@ -42,7 +42,7 @@ def compare_embeddings(emb1, emb2):
     dist = np.linalg.norm(emb1 - emb2)
     return dist, dist < THRESHOLD
 
-def recognize_face_once(timeout=60):
+def recognize_face_once(expected_username, timeout=60):
     cap = cv2.VideoCapture(0)
     name = None
     start_time = time.time()
@@ -53,6 +53,11 @@ def recognize_face_once(timeout=60):
         ret, frame = cap.read()
         if not ret:
             continue
+
+        # show username to verify
+        cv2.putText(frame, f"Can xac thuc: {expected_username}", 
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         faces = detector(gray)
 
@@ -73,15 +78,19 @@ def recognize_face_once(timeout=60):
             name = matched_name
             break
 
-        if name != None:
+        if name is not None:
             break
 
         if time.time() - start_time > timeout:
             print("[TIMEOUT] 1 phút không ai xác thực")
+            name = None
             break
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
+            name = None
             break
+
+        cv2.imshow("Verify", frame)
 
     cap.release()
     cv2.destroyAllWindows()
@@ -96,13 +105,12 @@ def poll_pending():
                 pending = [x for x in data if x["status"]=="pending"]
                 for record in pending:
                     print(f"[Pending] ID={record['id']} user={record['user']['username']}")
-                    recognized_name = recognize_face_once()
+                    recognized_name = recognize_face_once(record["user"]["username"])
                     if recognized_name == record["user"]["username"]:
                         put_attendance(record["id"], status="in")
-                    elif recognized_name == "Unknown" or recognized_name is None:
-                        put_attendance(record["id"], status="invalid")
                     else:
-                        put_attendance(record["id"], status="invalid")
+                        # Unknown hoặc không khớp thì KHÔNG PUT
+                        print("[INFO] Xac thuc that bai, khong PUT")
         except Exception as e:
             print(f"[poll_pending] {e}")
         time.sleep(POLL_INTERVAL)
@@ -116,14 +124,13 @@ def poll_in():
                 ins = [x for x in data if x["status"]=="in"]
                 for record in ins:
                     print(f"[In] ID={record['id']} user={record['user']['username']}")
-                    recognized_name = recognize_face_once()
+                    recognized_name = recognize_face_once(record["user"]["username"])
                     if recognized_name == record["user"]["username"]:
                         now = datetime.now().isoformat()
                         put_attendance(record["id"], status="complete", checkout_time=now)
-                    elif recognized_name == "Unknown" or recognized_name is None:
-                        put_attendance(record["id"], status="invalid")
                     else:
-                        put_attendance(record["id"], status="invalid")
+                        # Unknown hoặc không khớp thì KHÔNG PUT
+                        print("[INFO] Xac thuc that bai, khong PUT")
         except Exception as e:
             print(f"[poll_in] {e}")
         time.sleep(POLL_INTERVAL)

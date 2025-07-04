@@ -33,15 +33,14 @@ mode = "idle"     # idle, verify, register
 target_user = None
 target_attendance_id = None
 target_register_user_id = None
+target_status = None  # pending / out
 recognition_start_time = None
 lock = threading.Lock()
-
 
 # ========== utility ==========
 def compare_embeddings(emb1, emb2):
     dist = np.linalg.norm(emb1 - emb2)
     return dist, dist < THRESHOLD
-
 
 def put_attendance(attendance_id, status, checkout_time=None):
     url = f"{API_ATTENDANCE}/{attendance_id}"
@@ -54,7 +53,6 @@ def put_attendance(attendance_id, status, checkout_time=None):
     except Exception as e:
         print(f"[API] Error {e}")
 
-
 def patch_register_request(request_id, status):
     url = f"{API_REGISTER_REQUEST}/{request_id}"
     payload = {"status": status}
@@ -64,56 +62,34 @@ def patch_register_request(request_id, status):
     except Exception as e:
         print(f"[API] Error {e}")
 
-
 def save_face(name, embedding):
     embeddings.append(embedding)
     labels.append(name)
     np.savez(DB_FILE, embeddings=embeddings, labels=labels)
     print(f"[DB] Saved face for {name}")
 
-
-# ========== polling thread ==========
-def poll_pending():
-    global mode, target_user, target_attendance_id, recognition_start_time
+# ========== polling threads ==========
+def poll_attendance():
+    global mode, target_user, target_attendance_id, recognition_start_time, target_status
     while True:
         try:
             res = requests.get(API_ATTENDANCE, timeout=5)
             if res.status_code == 200:
                 data = res.json()
-                pending = [x for x in data if x["status"] == "pending"]
-                with lock:
-                    if mode == "idle" and pending:
-                        record = pending[0]
-                        target_user = record["user"]["username"]
-                        target_attendance_id = record["id"]
-                        recognition_start_time = time.time()
-                        mode = "verify"
-                        print(f"[Pending] Need verify: {target_user} (ID={target_attendance_id})")
+                for record in data:
+                    if record["status"] in ["pending", "out"]:
+                        with lock:
+                            if mode == "idle":
+                                target_user = record["user"]["username"]
+                                target_attendance_id = record["id"]
+                                target_status = record["status"]
+                                recognition_start_time = time.time()
+                                mode = "verify"
+                                print(f"[Attendance] Need verify: {target_user} (ID={target_attendance_id}) status={target_status}")
+                                break
         except Exception as e:
-            print(f"[poll_pending] {e}")
+            print(f"[poll_attendance] {e}")
         time.sleep(POLL_INTERVAL)
-
-
-def poll_in():
-    global mode, target_user, target_attendance_id, recognition_start_time
-    while True:
-        try:
-            res = requests.get(API_ATTENDANCE, timeout=5)
-            if res.status_code == 200:
-                data = res.json()
-                ins = [x for x in data if x["status"] == "in"]
-                with lock:
-                    if mode == "idle" and ins:
-                        record = ins[0]
-                        target_user = record["user"]["username"]
-                        target_attendance_id = record["id"]
-                        recognition_start_time = time.time()
-                        mode = "verify"
-                        print(f"[In] Need verify checkout: {target_user} (ID={target_attendance_id})")
-        except Exception as e:
-            print(f"[poll_in] {e}")
-        time.sleep(POLL_INTERVAL)
-
 
 def poll_register_request():
     global mode, target_user, target_register_user_id
@@ -134,10 +110,9 @@ def poll_register_request():
             print(f"[poll_register_request] {e}")
         time.sleep(POLL_INTERVAL)
 
-
 # ========== camera loop ==========
 def camera_loop():
-    global mode, target_user, target_attendance_id, recognition_start_time, target_register_user_id
+    global mode, target_user, target_attendance_id, recognition_start_time, target_register_user_id, target_status
     cap = cv2.VideoCapture(0)
 
     while True:
@@ -154,6 +129,7 @@ def camera_loop():
             current_attendance_id = target_attendance_id
             current_register_request_id = target_register_user_id
             current_time = recognition_start_time
+            current_attendance_status = target_status
 
         for face in faces:
             landmarks = sp(gray, face)
@@ -179,12 +155,17 @@ def camera_loop():
 
                 if matched_name == current_user:
                     if current_time and time.time() - current_time <= 60:
-                        # verify thành công
-                        put_attendance(current_attendance_id, status="in")
+                        # xác thực thành công
+                        if current_attendance_status == "pending":
+                            put_attendance(current_attendance_id, status="in")
+                        elif current_attendance_status == "out":
+                            now = datetime.now().isoformat()
+                            put_attendance(current_attendance_id, status="complete", checkout_time=now)
                         with lock:
                             mode = "idle"
                             target_user = None
                             target_attendance_id = None
+                            target_status = None
                             recognition_start_time = None
                     elif current_time and time.time() - current_time > 60:
                         # timeout
@@ -193,13 +174,13 @@ def camera_loop():
                             mode = "idle"
                             target_user = None
                             target_attendance_id = None
+                            target_status = None
                             recognition_start_time = None
 
             elif current_mode == "register" and current_user:
                 cv2.putText(frame, f"REGISTER: {current_user}", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
-                # auto đăng ký nếu face centered
                 save_face(current_user, emb)
                 patch_register_request(current_register_request_id, status="DONE")
                 with lock:
@@ -214,17 +195,13 @@ def camera_loop():
     cap.release()
     cv2.destroyAllWindows()
 
-
 # ========== main ==========
 def main():
-    t1 = threading.Thread(target=poll_pending, daemon=True)
-    t2 = threading.Thread(target=poll_in, daemon=True)
-    t3 = threading.Thread(target=poll_register_request, daemon=True)
+    t1 = threading.Thread(target=poll_attendance, daemon=True)
+    t2 = threading.Thread(target=poll_register_request, daemon=True)
     t1.start()
     t2.start()
-    t3.start()
     camera_loop()
-
 
 if __name__ == "__main__":
     main()

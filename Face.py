@@ -1,233 +1,231 @@
-import os, time, subprocess, psutil, csv, random
-from datetime import datetime
-from threading import Thread, Event
+# -*- coding: utf-8 -*-
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import psutil
+import os
+import joblib
+import subprocess
+import sys
 
-# -----------------------------
-ALGORITHMS = {
-    "ascon128": 128,
-    "ascon80pq": 80,
-    "speck32_64": 64,
-    "speck64_128": 128,
-    "present80": 80,
-    "present128": 128,
-    "aes128": 128,
-    "aes256": 256,
-    "chacha20": 128,
-    "grain128": 128
+# -----------------------
+# Dictionary chứa thông tin thuật toán
+# -----------------------
+algo_info = {
+    "ascon128": {"key_size": 128, "binary": "./bench_ascon"},
+    "aes128": {"key_size": 128, "binary": "./bench_aes"},
+    "aes256": {"key_size": 256, "binary": "./bench_aes"},
+    "chacha20": {"key_size": 128, "binary": "./bench_chacha20"},
+    "grain128": {"key_size": 128, "binary": "./bench_grain"},
+    "led64": {"key_size": 64, "binary": "./bench_led"},
+    "led128": {"key_size": 128, "binary": "./bench_led"},
+    "present80": {"key_size": 80, "binary": "./bench_present"},
+    "present128": {"key_size": 128, "binary": "./bench_present"},
+    "simon32_64": {"key_size": 64, "binary": "./bench_simon"},
+    "simon64_128": {"key_size": 128, "binary": "./bench_simon"},
+    "speck32_64": {"key_size": 64, "binary": "./bench_speck"},
+    "speck64_128": {"key_size": 128, "binary": "./bench_speck"},
+    "twine80": {"key_size": 80, "binary": "./bench_TWINE"},
+    "twine128": {"key_size": 128, "binary": "./bench_TWINE"}
 }
 
-SIZES = [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+# -----------------------
+# PRESENT encrypt Python (byte-wise sbox)
+# -----------------------
+def present_encrypt_python(data: str) -> str:
+    sbox = [0xC,5,6,0xB,9,0,0xA,0xD,3,0xE,0xF,8,4,7,1,2]
+    out_bytes = []
+    for b in data.encode('utf-8'):
+        out_bytes.append((sbox[b >> 4] << 4) | sbox[b & 0x0F])
+    return ''.join(f'{b:02X}' for b in out_bytes)
 
-BASE_POWER_W = 2.5
-MAX_POWER_W = 7.0
-
-CSV_FILE = "pi4_crypto_benchmark_fullstress.csv"
-
-# Stress level configuration
-STRESS_MODE = "progressive"  # "progressive" hoặc "random"
-MAX_TEMP_C = 70.0
-WARNING_TEMP_C = 65.0
-
-# Global stress level (0.0 to 1.0)
-stress_level = 0.0
-
-# -----------------------------
-def get_cpu_temp():
+# -----------------------
+# Hàm encrypt_data
+# -----------------------
+def encrypt_data(data: str, algo: str, binary: str) -> str:
     try:
-        out = subprocess.check_output(["vcgencmd", "measure_temp"]).decode().strip()
-        return float(out.replace("temp=", "").replace("'C", ""))
-    except:
+        if 'present' in algo.lower():
+            # Dùng Python implementation cho PRESENT
+            ciphertext = present_encrypt_python(data)
+        else:
+            # Ghi tạm vào file
+            temp_input = 'temp_input.txt'
+            with open(temp_input, 'w', encoding='utf-8') as f:
+                f.write(data)
+
+            cmd = [binary, temp_input]
+            if algo in ['aes128', 'aes256']:
+                cmd.extend(['--keysize', str(algo_info[algo]['key_size'])])
+
+            result = subprocess.run(cmd, text=True, capture_output=True, check=True)
+            os.remove(temp_input)
+
+            # Tìm Ciphertext từ stdout
+            ciphertext = None
+            for line in result.stdout.splitlines():
+                if line.startswith('Ciphertext: '):
+                    ciphertext = line.split('Ciphertext: ')[1].strip()
+                    break
+            if not ciphertext:
+                print(f"Lỗi: Không tìm thấy Ciphertext trong output của {algo}")
+                ciphertext = None
+
+        return ciphertext
+    except Exception as e:
+        print(f"Lỗi khi mã hóa {algo}: {e}")
         return None
 
-def estimate_energy(exec_time_s, cpu_usage_percent):
-    avg_power = BASE_POWER_W + (MAX_POWER_W - BASE_POWER_W) * (cpu_usage_percent / 100.0)
-    return avg_power * exec_time_s
-
-# CPU stress với điều chỉnh cấp độ
-def cpu_stress(stop_event):
-    global stress_level
-    while not stop_event.is_set():
-        # Tính số cores dựa trên stress level
-        num_cores = max(1, int(psutil.cpu_count() * stress_level))
-        if num_cores == 0:
-            time.sleep(0.01)
-            continue
-        
-        loop_size = int(500000 * (0.3 + stress_level * 0.7))  # 500k-1000k
-        for _ in range(num_cores):
-            _ = [x*x for x in range(loop_size)]
-        time.sleep(0.01)
-
-# RAM stress với điều chỉnh cấp độ
-def ram_stress(stop_event):
-    global stress_level
-    total_mem = psutil.virtual_memory().total
-    blocks = []
-
-    while not stop_event.is_set():
-        try:
-            mem = psutil.virtual_memory()
-            
-            if mem.available < 100*1024*1024:  # Nếu còn < 100MB
-                blocks.clear()
-                time.sleep(0.1)
-                continue
-            
-            # RAM target dựa trên stress level (5% - 50%)
-            min_ram = 5
-            max_ram = 50
-            target_percent = min_ram + (max_ram - min_ram) * stress_level
-            target_bytes = int(total_mem * target_percent / 100)
-
-            current_bytes = sum(len(b) for b in blocks)
-
-            if current_bytes < target_bytes:
-                alloc_bytes = min(target_bytes - current_bytes, 20*1024*1024)
-                blocks.append(bytearray(alloc_bytes))
-            elif current_bytes > target_bytes:
-                while blocks and current_bytes > target_bytes:
-                    b = blocks.pop(0)
-                    current_bytes -= len(b)
-            
-            time.sleep(0.05)
-        except MemoryError:
-            blocks.clear()
-            time.sleep(0.1)
-
-# Disk I/O stress với điều chỉnh cấp độ
-def disk_io_stress(stop_event):
-    global stress_level
-    while not stop_event.is_set():
-        try:
-            # Disk size dựa trên stress level (0.5MB - 2MB)
-            min_size = 0.5 * 1024 * 1024
-            max_size = 2 * 1024 * 1024
-            io_size = int(min_size + (max_size - min_size) * stress_level)
-            
-            fname = "/tmp/io_test.tmp"
-            with open(fname, "wb") as f:
-                f.write(os.urandom(io_size))
-            with open(fname, "rb") as f:
-                _ = f.read()
-            os.remove(fname)
-        except Exception as e:
-            pass
-        time.sleep(0.1)
-
-# Network stress
-def network_stress(stop_event):
-    import socket
+# -----------------------
+# Hàm đọc data.txt
+# -----------------------
+def read_data_file(file_path='data.txt'):
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        while not stop_event.is_set():
-            try:
-                sock.sendto(b"x"*512, ("127.0.0.1", 5005))
-            except:
-                pass
-            time.sleep(0.05)
-        sock.close()
-    except Exception as e:
-        pass
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+        size_bytes = len(content.encode('utf-8'))
+        return content, size_bytes
+    except:
+        return "phamjLong", len("phamjLong".encode('utf-8'))
 
-def benchmark_algorithm_fullstress(alg, size):
-    global stress_level
-    temp_start = get_cpu_temp()
-    t0 = time.perf_counter()
+# -----------------------
+# Lấy metrics phần cứng Pi
+# -----------------------
+def get_hardware_metrics():
+    try:
+        cpu_avg = psutil.cpu_percent(interval=1)
+        ram = psutil.virtual_memory()
+        ram_usage = ram.percent
+        temp_file = '/sys/class/thermal/thermal_zone0/temp'
+        temp = float(open(temp_file).read()) / 1000 if os.path.exists(temp_file) else 40.0
+        return {
+            'cpu_avg_%': cpu_avg,
+            'ram_%': ram_usage,
+            'temp_start_C': temp,
+            'stress_level': 1.0,
+            'raw_energy_J': 0.0,
+            'mem_used_MB': ram.used / (1024*1024),
+            'mem_cached_MB': ram.cached / (1024*1024),
+            'mem_buffers_MB': ram.buffers / (1024*1024),
+            'disk_read_MB': 0.0,
+            'disk_write_MB': 0.0,
+            'disk_read_count': 0.0,
+            'disk_write_count': 0.0,
+            'net_sent_MB': 0.0,
+            'net_recv_MB': 0.0
+        }
+    except:
+        return {
+            'cpu_avg_%': 20.0, 'ram_%': 20.0, 'temp_start_C': 40.0, 'stress_level': 1.0,
+            'raw_energy_J': 0.0, 'mem_used_MB': 100.0, 'mem_cached_MB': 50.0, 'mem_buffers_MB': 10.0,
+            'disk_read_MB': 0.0, 'disk_write_MB': 0.0, 'disk_read_count': 0.0, 'disk_write_count': 0.0,
+            'net_sent_MB': 0.0, 'net_recv_MB': 0.0
+        }
 
-    # Simulate algorithm execution
-    _ = [x*x for x in range(size*100)]
+# -----------------------
+# Hàm tính performance score
+# -----------------------
+def calculate_performance_score(exec_time, energy, temp_end, cpu_avg, ram_usage):
+    time_score = 100*(1 - np.clip(exec_time/0.1,0,1))
+    energy_score = 100*(1 - np.clip(energy/0.01,0,1))
+    temp_score = 100*(1 - abs(temp_end-40)/20)
+    cpu_score = 100*(1 - abs(cpu_avg-20)/40)
+    ram_score = 100*(1 - abs(ram_usage-20)/40)
+    score = 0.3*time_score + 0.3*energy_score + 0.2*temp_score + 0.1*cpu_score + 0.1*ram_score
+    return np.round(np.clip(score,0,100),2)
 
-    t1 = time.perf_counter()
-    temp_end = get_cpu_temp()
+# -----------------------
+# Hàm dự đoán thuật toán tối ưu
+# -----------------------
+def predict_best_algorithm(model_time, model_energy, scaler_X, scaler_time, scaler_energy):
+    algorithms = list(algo_info.keys())
+    algo_columns = [f'algo_{algo}' for algo in algorithms]
+    feature_cols = [
+        'size_bytes', 'stress_level', 'cpu_avg_%', 'ram_%', 'temp_start_C',
+        'raw_energy_J', 'mem_used_MB', 'mem_cached_MB', 'mem_buffers_MB',
+        'disk_read_MB', 'disk_write_MB', 'disk_read_count', 'disk_write_count',
+        'net_sent_MB', 'net_recv_MB'
+    ] + algo_columns
 
-    cpu_percore = psutil.cpu_percent(interval=1, percpu=True)
-    cpu_avg = sum(cpu_percore)/len(cpu_percore)
-    ram_usage = psutil.virtual_memory().percent
-    freq = psutil.cpu_freq().current if psutil.cpu_freq() else 0
-    exec_time = t1-t0
-    energy = estimate_energy(exec_time, cpu_avg)
+    data_content, size_bytes = read_data_file()
+    hw_metrics = get_hardware_metrics()
+    input_data = {'size_bytes': size_bytes, **hw_metrics}
+    for algo in algo_columns:
+        input_data[algo] = 0.0
+    df_input = pd.DataFrame([input_data])
+
+    input_features = df_input[feature_cols].astype(float).values
+    input_features_norm = scaler_X.transform(input_features)
+    sample_features = torch.tensor(input_features_norm, dtype=torch.float32).to('cpu')[0]
+
+    algo_scores = []
+    for algo in algorithms:
+        features = sample_features.clone()
+        for i, col in enumerate(feature_cols):
+            if col in algo_columns:
+                features[i] = 1.0 if col==f'algo_{algo}' else 0.0
+        time_preds,_ = model_time(features.unsqueeze(0))
+        energy_preds,_ = model_energy(features.unsqueeze(0))
+        avg_time = np.maximum(0, scaler_time.inverse_transform(time_preds.cpu().numpy()).mean())
+        avg_energy = np.maximum(0, scaler_energy.inverse_transform(energy_preds.cpu().numpy()).mean())
+        avg_temp = hw_metrics['temp_start_C']
+        avg_cpu = hw_metrics['cpu_avg_%']
+        avg_ram = hw_metrics['ram_%']
+        score = calculate_performance_score(avg_time, avg_energy, avg_temp, avg_cpu, avg_ram)
+        ciphertext = encrypt_data(data_content, algo, algo_info[algo]['binary'])
+        algo_scores.append({
+            'algorithm': algo,
+            'avg_exec_time_s': avg_time,
+            'avg_energy_J': avg_energy,
+            'avg_temp_C': avg_temp,
+            'avg_cpu_%': avg_cpu,
+            'avg_ram_%': avg_ram,
+            'performance_score': score,
+            'ciphertext': ciphertext
+        })
+
+    df_ranked = pd.DataFrame(algo_scores)
+    df_ranked = df_ranked.sort_values(by='performance_score', ascending=False)
+    df_ranked = df_ranked[~df_ranked['algorithm'].isin(['aes128','aes256'])]
+
+    print("\n" + "="*60)
+    print("ALGORITHM RANKING TABLE")
+    print("="*60)
+    print(df_ranked[['algorithm','avg_exec_time_s','avg_energy_J',
+                     'avg_temp_C','avg_cpu_%','avg_ram_%','performance_score']].to_string(index=False))
+    print("="*60)
+
+    best_algo_row = df_ranked.iloc[0]
+    best_algo = best_algo_row['algorithm']
+    best_ciphertext = best_algo_row['ciphertext']
+
+    print(f"\nBEST OPTIMIZED ALGORITHM: {best_algo}")
+    print(f"Ciphertext:\n{best_ciphertext}")
+
+    # Lưu ciphertext
+    with open('encrypted_output.txt', 'w') as f:
+        f.write(best_ciphertext)
+
+    return df_ranked, best_ciphertext
+
+# -----------------------
+# Load mô hình và scaler
+# -----------------------
+try:
+    scaler_X = joblib.load('scaler_X.pkl')
+    scaler_time = joblib.load('scaler_time.pkl')
+    scaler_energy = joblib.load('scaler_energy.pkl')
     
-    return {
-        "algorithm": alg, "size": size, "cpu_avg": cpu_avg, "cpu_per_core": cpu_percore,
-        "ram": ram_usage, "freq": freq, "temp_start": temp_start, "temp_end": temp_end,
-        "exec_time": exec_time, "energy": energy, "stress_level": round(stress_level, 2)
-    }
+    inp_dim = 15 + len(algo_info)  # 15 features + thuật toán
+    model_time = torch.load('tabnet_time_model.pth', map_location='cpu')
+    model_energy = torch.load('tabnet_energy_model.pth', map_location='cpu')
+    model_time.eval()
+    model_energy.eval()
 
-# Cập nhật stress level
-def update_stress_level(alg_index, alg_count, size_index, size_count):
-    global stress_level
-    if STRESS_MODE == "progressive":
-        # Tăng dần từ 0 đến 1.0
-        total_iterations = alg_count * size_count
-        current_iteration = alg_index * size_count + size_index
-        stress_level = min(1.0, current_iteration / total_iterations)
-    elif STRESS_MODE == "random":
-        # Random từ 0 đến 1.0
-        stress_level = random.uniform(0.0, 1.0)
-
-# Chạy benchmark với tất cả các thuật toán
-def run_benchmark_all_fullstress():
-    global stress_level
-    stop_event = Event()
-
-    # Start stress threads
-    threads = [
-        Thread(target=cpu_stress, args=(stop_event,), daemon=True),
-        Thread(target=ram_stress, args=(stop_event,), daemon=True),
-        Thread(target=disk_io_stress, args=(stop_event,), daemon=True),
-        Thread(target=network_stress, args=(stop_event,), daemon=True)
-    ]
-    for th in threads:
-        th.start()
-
-    alg_list = list(ALGORITHMS.keys())
-    alg_count = len(alg_list)
-    size_count = len(SIZES)
-
-    # Write CSV
-    with open(CSV_FILE, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "algorithm", "size_bytes", "stress_level", "cpu_avg_%", "cpu_per_core_%",
-            "ram_%", "freq_MHz", "temp_start_C", "temp_end_C", "exec_time_s", "energy_J", "timestamp"
-        ])
-
-        stop_benchmark = False
-        for alg_idx, alg in enumerate(alg_list):
-            for size_idx, size in enumerate(SIZES):
-                if stop_benchmark:
-                    break
-                
-                # Cập nhật stress level
-                update_stress_level(alg_idx, alg_count, size_idx, size_count)
-                
-                row = benchmark_algorithm_fullstress(alg, size)
-                timestamp = datetime.now().isoformat()
-                
-                print(f"\n[Stress: {row['stress_level']}] Algorithm: {row['algorithm']} | Size: {row['size']} bytes")
-                print(f"  CPU avg: {row['cpu_avg']:.2f}% | RAM: {row['ram']:.2f}% | Freq: {row['freq']:.2f} MHz")
-                print(f"  Temp: {row['temp_start']:.1f}°C → {row['temp_end']:.1f}°C")
-                print(f"  Exec time: {row['exec_time']:.6f}s | Energy: {row['energy']:.6f}J")
-                
-                writer.writerow([
-                    row["algorithm"], row["size"], row["stress_level"],
-                    round(row["cpu_avg"], 2), row["cpu_per_core"], round(row["ram"], 2),
-                    round(row["freq"], 2), row["temp_start"], row["temp_end"],
-                    round(row["exec_time"], 6), round(row["energy"], 6), timestamp
-                ])
-                
-                if row["temp_end"] >= MAX_TEMP_C:
-                    print(f"\n⚠️  CPU {row['temp_end']:.1f}°C >= {MAX_TEMP_C}°C, dừng benchmark")
-                    stop_benchmark = True
-                    break
-    
-    stop_event.set()
-    print(f"\nBenchmark hoàn thành! Kết quả lưu vào: {CSV_FILE}")
-
-# -----------------------------
-if __name__ == "__main__":
-    print(f"Mode stress: {STRESS_MODE}")
-    print(f"  - 'progressive': Tăng dần từ 0 → 100%")
-    print(f"  - 'random': Random 0-100% mỗi lần\n")
-    run_benchmark_all_fullstress()
+    print("\nĐang dự đoán thuật toán tối ưu và mã hóa dữ liệu...")
+    ranked_df, encrypted_data = predict_best_algorithm(model_time, model_energy,
+                                                        scaler_X, scaler_time, scaler_energy)
+except Exception as e:
+    print(f"Lỗi khi tải model hoặc scaler: {e}")
+    sys.exit(1)

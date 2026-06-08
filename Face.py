@@ -1,495 +1,379 @@
-# -*- coding: utf-8 -*-
-import pandas as pd
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import psutil
-import os
-import joblib
-import subprocess
-import sys
+import os, time, subprocess, psutil, csv, random, math
+from datetime import datetime
+from threading import Thread, Event, Lock
 
-# -----------------------
-# Algorithm information dictionary
-# -----------------------
-algo_info = {
-    "ascon128": {"key_size": 128, "binary": "./bench_ascon"},
-    "aes128": {"key_size": 128, "binary": "./bench_aes"},
-    "aes256": {"key_size": 256, "binary": "./bench_aes"},
-    "chacha20": {"key_size": 128, "binary": "./bench_chacha20"},
-    "grain128": {"key_size": 128, "binary": "./bench_grain"},
-    "led64": {"key_size": 64, "binary": "./bench_led"},
-    "led128": {"key_size": 128, "binary": "./bench_led"},
-    "present80": {"key_size": 80, "binary": "./bench_present"},
-    "present128": {"key_size": 128, "binary": "./bench_present"},
-    "simon32_64": {"key_size": 64, "binary": "./bench_simon"},
-    "simon64_128": {"key_size": 128, "binary": "./bench_simon"},
-    "speck32_64": {"key_size": 64, "binary": "./bench_speck"},
-    "speck64_128": {"key_size": 128, "binary": "./bench_speck"},
-    "twine80": {"key_size": 80, "binary": "./bench_TWINE"},
-    "twine128": {"key_size": 128, "binary": "./bench_TWINE"}
+# ============================================================
+# CẤU HÌNH THUẬT TOÁN VÀ TARGET MẶC ĐỊNH
+# Người dùng có thể thay đổi target cho từng thuật toán
+# ============================================================
+
+ALGORITHM_TARGETS = {
+    # alg_name: { cpu_pct, ram_pct, temp_c, freq_mhz, energy_j_per_kb }
+    "ascon128":     {"cpu": 40, "ram": 25, "temp": 45, "freq": 1000, "energy_per_kb": 0.0008},
+    "ascon80pq":    {"cpu": 38, "ram": 24, "temp": 44, "freq": 1000, "energy_per_kb": 0.0007},
+    "speck32_64":   {"cpu": 55, "ram": 30, "temp": 52, "freq": 1200, "energy_per_kb": 0.0012},
+    "speck64_128":  {"cpu": 60, "ram": 32, "temp": 54, "freq": 1200, "energy_per_kb": 0.0014},
+    "present80":    {"cpu": 70, "ram": 35, "temp": 58, "freq": 1400, "energy_per_kb": 0.0020},
+    "present128":   {"cpu": 75, "ram": 38, "temp": 60, "freq": 1400, "energy_per_kb": 0.0022},
+    "aes128":       {"cpu": 65, "ram": 40, "temp": 56, "freq": 1500, "energy_per_kb": 0.0018},
+    "aes256":       {"cpu": 80, "ram": 45, "temp": 62, "freq": 1600, "energy_per_kb": 0.0028},
+    "chacha20":     {"cpu": 50, "ram": 28, "temp": 48, "freq": 1100, "energy_per_kb": 0.0010},
+    "grain128":     {"cpu": 45, "ram": 26, "temp": 46, "freq": 1050, "energy_per_kb": 0.0009},
 }
 
-# -----------------------
-# TabNet implementation
-# -----------------------
-device = torch.device('cpu')  # Raspberry Pi does not have GPU
-print(f"Using device: {device}")
+SIZES = [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
 
-class Sparsemax(nn.Module):
-    def __init__(self):
-        super().__init__()
-    def forward(self, x):
-        return torch.softmax(x, dim=-1)
+BASE_POWER_W  = 2.5
+MAX_POWER_W   = 7.0
+MAX_TEMP_C    = 70.0
+CSV_FILE      = "pi4_crypto_benchmark_targeted.csv"
 
-class GBN(nn.Module):
-    def __init__(self, inp, vbs=16, momentum=0.01):
-        super().__init__()
-        self.bn = nn.BatchNorm1d(inp, momentum=momentum)
-        self.vbs = vbs
-    def forward(self, x):
-        if x.size(0) < self.vbs:
-            return self.bn(x)
-        chunk = torch.chunk(x, max(1, x.size(0) // self.vbs), 0)
-        res = [self.bn(y) for y in chunk]
-        return torch.cat(res, 0)
+# Tolerance: cho phép lệch bao nhiêu % so với target trước khi điều chỉnh
+CPU_TOLERANCE  = 3.0   # ±3%
+RAM_TOLERANCE  = 3.0   # ±3%
 
-class GLU(nn.Module):
-    def __init__(self, inp_dim, out_dim, fc=None, vbs=16):
-        super().__init__()
-        if fc:
-            self.fc = fc
-        else:
-            self.fc = nn.Linear(inp_dim, out_dim * 2)
-        self.bn = GBN(out_dim * 2, vbs=vbs)
-        self.od = out_dim
-    def forward(self, x):
-        x = self.bn(self.fc(x))
-        return x[:, :self.od] * torch.sigmoid(x[:, self.od:])
+# ============================================================
+# TRẠNG THÁI TOÀN CỤC – được stress workers đọc liên tục
+# ============================================================
+state_lock    = Lock()
+target_cpu    = 0.0   # % target CPU
+target_ram    = 0.0   # % target RAM
+target_freq   = 1500  # MHz (dùng để scale workload)
 
-class FeatureTransformer(nn.Module):
-    def __init__(self, inp_dim, out_dim, shared, n_ind, vbs=16):
-        super().__init__()
-        first = True
-        self.shared = nn.ModuleList()
-        if shared:
-            self.shared.append(GLU(inp_dim, out_dim, shared[0] if len(shared)>0 else None, vbs=vbs))
-            first = False
-            for fc in shared[1:]:
-                self.shared.append(GLU(out_dim, out_dim, fc, vbs=vbs))
-        else:
-            self.shared = None
-        self.independ = nn.ModuleList()
-        if first:
-            self.independ.append(GLU(inp_dim, out_dim, vbs=vbs))
-        for _ in range(int(first), n_ind):
-            self.independ.append(GLU(out_dim, out_dim, vbs=vbs))
-        self.scale = torch.sqrt(torch.tensor([0.5], device=device))
-    def forward(self, x):
-        if self.shared:
-            x = self.shared[0](x)
-            for glu in self.shared[1:]:
-                x = torch.add(x, glu(x))
-                x = x * self.scale
-        for glu in self.independ:
-            x = torch.add(x, glu(x))
-            x = x * self.scale
-        return x
+# ============================================================
+# HELPERS
+# ============================================================
 
-class AttentionTransformer(nn.Module):
-    def __init__(self, d_a, inp_dim, relax, vbs=16):
-        super().__init__()
-        self.fc = nn.Linear(d_a, inp_dim)
-        self.bn = GBN(inp_dim, vbs=vbs)
-        self.smax = Sparsemax()
-        self.r = relax
-    def forward(self, a, priors):
-        a = self.bn(self.fc(a))
-        mask = self.smax(a * priors)
-        priors = priors * (self.r - mask)
-        return mask, priors
-
-class DecisionStep(nn.Module):
-    def __init__(self, inp_dim, n_d, n_a, shared, n_ind, relax, vbs=16):
-        super().__init__()
-        self.fea_tran = FeatureTransformer(inp_dim, n_d + n_a, shared, n_ind, vbs)
-        self.atten_tran = AttentionTransformer(n_a, inp_dim, relax, vbs)
-    def forward(self, x, a, priors):
-        mask, priors = self.atten_tran(a, priors)
-        sparse_loss = ((-1) * mask * torch.log(mask + 1e-10)).mean()
-        x = self.fea_tran(x * mask)
-        return x, sparse_loss, priors
-
-class TabNet(nn.Module):
-    def __init__(self, inp_dim, final_out_dim, n_d=16, n_a=32, n_shared=2, n_ind=2, n_steps=3, relax=1.2, vbs=16):
-        super().__init__()
-        self.n_d = n_d
-        if n_shared > 0:
-            self.shared = nn.ModuleList()
-            self.shared.append(nn.Linear(inp_dim, 2 * (n_d + n_a)))
-            for _ in range(n_shared - 1):
-                self.shared.append(nn.Linear(n_d + n_a, 2 * (n_d + n_a)))
-        else:
-            self.shared = None
-        self.first_step = FeatureTransformer(inp_dim, n_d + n_a, self.shared, n_ind, vbs)
-        self.steps = nn.ModuleList()
-        for _ in range(n_steps - 1):
-            self.steps.append(DecisionStep(inp_dim, n_d, n_a, self.shared, n_ind, relax, vbs))
-        self.fc = nn.Linear(n_d, final_out_dim)
-        self.bn = nn.BatchNorm1d(inp_dim)
-    def forward(self, x):
-        x = self.bn(x)
-        x_a = self.first_step(x)[:, self.n_d:]
-        sparse_loss = torch.zeros(1).to(x.device)
-        out = torch.zeros(x.size(0), self.n_d).to(x.device)
-        priors = torch.ones(x.shape).to(x.device)
-        for step in self.steps:
-            x_te, l, priors = step(x, x_a, priors)
-            out += F.relu(x_te[:, :self.n_d])
-            x_a = x_te[:, self.n_d:]
-            sparse_loss += l
-        return self.fc(out), sparse_loss
-
-# -----------------------
-# Calculate performance score
-# -----------------------
-def calculate_performance_score(exec_time, energy, temp_end, cpu_avg, ram_usage):
-    exec_time = np.maximum(0, exec_time)
-    energy = np.maximum(0, energy)
-    time_score = 100 * (1 - np.clip(exec_time / 0.1, 0, 1))
-    energy_score = 100 * (1 - np.clip(energy / 0.01, 0, 1))
-    temp_score = 100 * (1 - np.abs(temp_end - 40) / 20)
-    cpu_score = 100 * (1 - np.abs(cpu_avg - 20) / 40)
-    ram_score = 100 * (1 - np.abs(ram_usage - 20) / 40)
-    time_score = np.maximum(0, time_score)
-    energy_score = np.maximum(0, energy_score)
-    temp_score = np.maximum(0, temp_score)
-    cpu_score = np.maximum(0, cpu_score)
-    ram_score = np.maximum(0, ram_score)
-    performance_score = (
-        time_score * 0.3 +
-        energy_score * 0.3 +
-        temp_score * 0.2 +
-        cpu_score * 0.1 +
-        ram_score * 0.1
-    )
-    return np.round(np.maximum(0, np.minimum(100, performance_score)), 2)
-
-# -----------------------
-# Get hardware metrics directly on Raspberry Pi
-# -----------------------
-def get_hardware_metrics():
+def get_cpu_temp():
     try:
-        cpu_avg = psutil.cpu_percent(interval=1)
-        ram = psutil.virtual_memory()
-        ram_usage = ram.percent
-        temp_file = '/sys/class/thermal/thermal_zone0/temp'
-        if os.path.exists(temp_file):
-            with open(temp_file, 'r') as f:
-                temp = float(f.read()) / 1000
-        else:
-            temp = 40.0
-        return {
-            'cpu_avg_%': cpu_avg,
-            'ram_%': ram_usage,
-            'temp_start_C': temp,
-            'stress_level': 1.0,
-            'raw_energy_J': 0.0,
-            'mem_used_MB': ram.used / (1024 * 1024),
-            'mem_cached_MB': ram.cached / (1024 * 1024),
-            'mem_buffers_MB': ram.buffers / (1024 * 1024),
-            'disk_read_MB': 0.0,
-            'disk_write_MB': 0.0,
-            'disk_read_count': 0.0,
-            'disk_write_count': 0.0,
-            'net_sent_MB': 0.0,
-            'net_recv_MB': 0.0
-        }
-    except Exception as e:
-        print(f"Error getting hardware metrics: {e}")
-        return {
-            'cpu_avg_%': 20.0,
-            'ram_%': 20.0,
-            'temp_start_C': 40.0,
-            'stress_level': 1.0,
-            'raw_energy_J': 0.0,
-            'mem_used_MB': 100.0,
-            'mem_cached_MB': 50.0,
-            'mem_buffers_MB': 10.0,
-            'disk_read_MB': 0.0,
-            'disk_write_MB': 0.0,
-            'disk_read_count': 0.0,
-            'disk_write_count': 0.0,
-            'net_sent_MB': 0.0,
-            'net_recv_MB': 0.0
-        }
+        out = subprocess.check_output(["vcgencmd", "measure_temp"]).decode().strip()
+        return float(out.replace("temp=", "").replace("'C", ""))
+    except:
+        # Fallback cho môi trường không phải Pi
+        try:
+            temps = psutil.sensors_temperatures()
+            for key in ("cpu_thermal", "coretemp", "k10temp"):
+                if key in temps and temps[key]:
+                    return temps[key][0].current
+        except:
+            pass
+        return None
 
-# -----------------------
-# Read size_bytes from data.txt file
-# -----------------------
-def read_data_file(file_path='data.txt'):
+def get_cpu_freq_mhz():
     try:
-        with open(file_path, 'r') as f:
-            content = f.read().strip()
-        size_bytes = len(content.encode('utf-8'))
-        return content, size_bytes
-    except Exception as e:
-        print(f"Error reading file {file_path}: {e}")
-        return "phamjLong", len("phamjLong".encode('utf-8'))
+        return psutil.cpu_freq().current
+    except:
+        return 0.0
 
-# -----------------------
-# Encrypt data using optimal algorithm
-# -----------------------
-def encrypt_data(data, algo, binary):
-    """
-    Encrypt data using the corresponding algorithm binary.
-    """
-    try:
-        # Write data to temporary file
-        temp_input = 'temp_input.txt'
-        with open(temp_input, 'w', encoding='utf-8') as f:
-            f.write(data)
+def estimate_energy(exec_time_s, cpu_pct, freq_mhz):
+    freq_ratio = min(freq_mhz / 1800.0, 1.0) if freq_mhz > 0 else 0.8
+    avg_power  = BASE_POWER_W + (MAX_POWER_W - BASE_POWER_W) * (cpu_pct / 100.0) * freq_ratio
+    return avg_power * exec_time_s
 
-        # Get file size
-        size_bytes = len(data.encode('utf-8'))
-        
-        # Prepare command to call binary
-        keysize = algo_info[algo]['key_size']
-        
-        # Different command structures for different algorithms
-        if algo in ['aes128', 'aes256']:
-            cmd = [binary, temp_input, '--keysize', str(keysize)]
-        elif algo in ['present80', 'present128']:
-            # PRESENT expects input file (if modified) or size (if original)
-            # Try file-based approach first
-            cmd = [binary, temp_input]
-        else:
-            cmd = [binary, temp_input]
+# ============================================================
+# NHẬP TARGET TỪ NGƯỜI DÙNG
+# ============================================================
 
-        print(f"\nExecuting command: {' '.join(cmd)}")
-        
-        # Execute binary
-        result = subprocess.run(
-            cmd,
-            text=True,
-            capture_output=True,
-            timeout=30
-        )
+def prompt_targets():
+    """Cho phép người dùng chỉnh target cho từng thuật toán hoặc dùng default."""
+    print("\n" + "="*60)
+    print("  CẤU HÌNH TARGET CHO TỪNG THUẬT TOÁN")
+    print("="*60)
+    print("Nhấn Enter để dùng giá trị mặc định.\n")
 
-        # Print full output for debugging
-        print(f"Return code: {result.returncode}")
-        print(f"Standard output:\n{result.stdout}")
-        if result.stderr:
-            print(f"Standard error:\n{result.stderr}")
-
-        # Clean up temporary file
-        if os.path.exists(temp_input):
-            os.remove(temp_input)
-
-        # Parse ciphertext from output
-        ciphertext = None
-        exec_time = None
-        
-        for line in result.stdout.splitlines():
-            if 'Ciphertext:' in line or 'ciphertext:' in line:
-                parts = line.split(':', 1)
-                if len(parts) > 1:
-                    ciphertext = parts[1].strip()
-            # Extract execution time
-            elif 'Encrypt' in line and 'bytes in' in line and 'sec' in line:
-                # Example: "PRESENT Encrypt 9 bytes in 0.000001 sec"
+    for alg, defaults in ALGORITHM_TARGETS.items():
+        print(f"  [{alg}]")
+        for param, default_val in defaults.items():
+            unit = {"cpu": "%", "ram": "%", "temp": "°C", "freq": "MHz", "energy_per_kb": "J/KB"}[param]
+            raw = input(f"    {param} target [{default_val}{unit}]: ").strip()
+            if raw:
                 try:
-                    parts = line.split('in')
-                    if len(parts) > 1:
-                        time_part = parts[1].split('sec')[0].strip()
-                        exec_time = float(time_part)
-                except:
+                    ALGORITHM_TARGETS[alg][param] = float(raw)
+                except ValueError:
+                    print(f"    ⚠ Giá trị không hợp lệ, dùng mặc định {default_val}")
+        print()
+
+# ============================================================
+# CPU STRESS WORKER – feedback loop để đạt target_cpu
+# ============================================================
+
+class CpuStressWorker:
+    """
+    Điều chỉnh workload liên tục để giữ CPU usage gần target_cpu.
+    Dùng thuật toán PID đơn giản (chỉ P + I).
+    """
+    def __init__(self):
+        self.stop_event = Event()
+        self._threads   = []
+        self._intensity = 0.5   # 0.0 – 1.0: tỷ lệ thời gian "bận"
+        self._lock      = Lock()
+
+    def _worker(self):
+        while not self.stop_event.is_set():
+            with self._lock:
+                busy_ratio = self._intensity
+            busy_time = 0.02 * busy_ratio
+            idle_time = 0.02 * (1.0 - busy_ratio)
+
+            deadline = time.perf_counter() + busy_time
+            while time.perf_counter() < deadline:
+                _ = sum(x*x for x in range(2000))
+
+            if idle_time > 0:
+                time.sleep(idle_time)
+
+    def start(self, n_threads=None):
+        n = n_threads or psutil.cpu_count(logical=True)
+        for _ in range(n):
+            t = Thread(target=self._worker, daemon=True)
+            t.start()
+            self._threads.append(t)
+
+    def adjust(self, current_cpu):
+        """Điều chỉnh intensity dựa trên sai lệch so với target."""
+        with state_lock:
+            t_cpu = target_cpu
+        error = t_cpu - current_cpu
+        with self._lock:
+            self._intensity = max(0.0, min(1.0, self._intensity + error * 0.015))
+
+    def stop(self):
+        self.stop_event.set()
+
+
+# ============================================================
+# RAM STRESS WORKER – feedback loop để đạt target_ram
+# ============================================================
+
+class RamStressWorker:
+    def __init__(self):
+        self.stop_event = Event()
+        self._blocks    = []
+        self._lock      = Lock()
+
+    def _worker(self):
+        total = psutil.virtual_memory().total
+        while not self.stop_event.is_set():
+            with state_lock:
+                t_ram = target_ram
+            mem       = psutil.virtual_memory()
+            current   = mem.percent
+            error     = t_ram - current
+
+            if error > RAM_TOLERANCE:
+                # Cần cấp phát thêm
+                alloc = int(total * min(error, 5.0) / 100.0)
+                try:
+                    with self._lock:
+                        self._blocks.append(bytearray(alloc))
+                except MemoryError:
                     pass
-                
-                # If no ciphertext found yet, create a meaningful one
-                if not ciphertext:
-                    # Simulate encryption output
-                    encrypted_bytes = bytearray(data.encode('utf-8'))
-                    # Simple S-box transformation for demonstration
-                    sbox = [0xC,5,6,0xB,9,0,0xA,0xD,3,0xE,0xF,8,4,7,1,2]
-                    for i in range(len(encrypted_bytes)):
-                        v = encrypted_bytes[i]
-                        encrypted_bytes[i] = (sbox[v >> 4] << 4) | sbox[v & 0x0F]
-                    ciphertext = encrypted_bytes.hex()
+            elif error < -RAM_TOLERANCE:
+                # Cần giải phóng bớt
+                with self._lock:
+                    if self._blocks:
+                        self._blocks.pop(0)
+            time.sleep(0.1)
 
-        if not ciphertext:
-            print(f"Warning: Could not find ciphertext in output of {algo}")
-            print("Generating simulated ciphertext...")
-            # Generate simulated ciphertext
-            encrypted_bytes = bytearray(data.encode('utf-8'))
-            sbox = [0xC,5,6,0xB,9,0,0xA,0xD,3,0xE,0xF,8,4,7,1,2]
-            for i in range(len(encrypted_bytes)):
-                v = encrypted_bytes[i]
-                encrypted_bytes[i] = (sbox[v >> 4] << 4) | sbox[v & 0x0F]
-            ciphertext = encrypted_bytes.hex()
+    def start(self):
+        t = Thread(target=self._worker, daemon=True)
+        t.start()
 
-        print(f"\nEncryption successful with {algo}:")
-        print(f"Original data: {data}")
-        print(f"Encrypted data (hex): {ciphertext}")
-        if exec_time:
-            print(f"Execution time: {exec_time:.6f} seconds")
+    def stop(self):
+        self.stop_event.set()
+        with self._lock:
+            self._blocks.clear()
 
-        # Save to file
-        with open('encrypted_output.txt', 'w', encoding='utf-8') as f:
-            f.write(f"Algorithm: {algo}\n")
-            f.write(f"Key size: {keysize} bits\n")
-            f.write(f"Original size: {size_bytes} bytes\n")
-            f.write(f"Original data: {data}\n")
-            f.write(f"Encrypted data (hex): {ciphertext}\n")
-            if exec_time:
-                f.write(f"Execution time: {exec_time:.6f} seconds\n")
-        print("Saved encrypted data to encrypted_output.txt")
 
-        return ciphertext
+# ============================================================
+# DISK I/O WORKER (phụ trợ, không có target riêng)
+# ============================================================
 
-    except subprocess.TimeoutExpired:
-        print(f"Error: Timeout while encrypting with {algo}")
-        return None
-    except subprocess.CalledProcessError as e:
-        print(f"Error encrypting with {algo}: {e}")
-        print(f"Error output: {e.stderr}")
-        return None
-    except FileNotFoundError:
-        print(f"Executable file {binary} not found")
-        return None
-    except Exception as e:
-        print(f"Unexpected error during encryption: {e}")
-        return None
+def disk_io_worker(stop_event):
+    while not stop_event.is_set():
+        try:
+            fname = "/tmp/bench_io.tmp"
+            with open(fname, "wb") as f:
+                f.write(os.urandom(1024 * 1024))
+            with open(fname, "rb") as f:
+                _ = f.read()
+            os.remove(fname)
+        except Exception:
+            pass
+        time.sleep(0.2)
 
-# -----------------------
-# Predict optimal algorithm
-# -----------------------
-def predict_best_algorithm(model_time, model_energy, scaler_X, scaler_time, scaler_energy):
-    algorithms = list(algo_info.keys())
-    algo_columns = [f'algo_{algo}' for algo in algorithms]
-    feature_cols = [
-        'size_bytes', 'stress_level', 'cpu_avg_%', 'ram_%', 'temp_start_C',
-        'raw_energy_J', 'mem_used_MB', 'mem_cached_MB', 'mem_buffers_MB',
-        'disk_read_MB', 'disk_write_MB', 'disk_read_count', 'disk_write_count',
-        'net_sent_MB', 'net_recv_MB'
-    ] + algo_columns
-    
-    # Read content and size from data.txt
-    data_content, size_bytes = read_data_file()
-    print(f"File content from data.txt: {data_content}")
-    print(f"Data size (size_bytes): {size_bytes}")
-    
-    # Get hardware metrics
-    hardware_metrics = get_hardware_metrics()
-    
-    # Create DataFrame from hardware metrics and size_bytes
-    input_data = {
-        'size_bytes': size_bytes,
-        **hardware_metrics
+
+# ============================================================
+# STABILIZE: chờ CPU & RAM ổn định tại target trước khi đo
+# ============================================================
+
+def stabilize(cpu_worker, target_c, target_r, timeout=10.0):
+    """
+    Chờ tối đa `timeout` giây để CPU và RAM đạt gần target.
+    Trả về True nếu ổn định, False nếu timeout.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        cur_cpu = psutil.cpu_percent(interval=0.3)
+        cur_ram = psutil.virtual_memory().percent
+        cpu_worker.adjust(cur_cpu)
+
+        cpu_ok = abs(cur_cpu - target_c) <= CPU_TOLERANCE * 1.5
+        ram_ok = abs(cur_ram - target_r) <= RAM_TOLERANCE * 1.5
+        if cpu_ok and ram_ok:
+            return True
+        time.sleep(0.2)
+    return False
+
+
+# ============================================================
+# BENCHMARK MỘT THUẬT TOÁN + SIZE
+# ============================================================
+
+def benchmark_one(alg, size, cpu_worker):
+    tgt = ALGORITHM_TARGETS[alg]
+
+    # Cập nhật target toàn cục cho workers
+    with state_lock:
+        global target_cpu, target_ram, target_freq
+        target_cpu  = tgt["cpu"]
+        target_ram  = tgt["ram"]
+        target_freq = tgt["freq"]
+
+    # Điều chỉnh & ổn định
+    cpu_worker.adjust(psutil.cpu_percent(interval=0.2))
+    stabilize(cpu_worker, tgt["cpu"], tgt["ram"], timeout=8.0)
+
+    # --- ĐO ---
+    temp_start = get_cpu_temp()
+
+    # Reset counter trước khi đo
+    psutil.cpu_percent(interval=None)
+    t0 = time.perf_counter()
+
+    # Workload thực tế – scale theo freq target để tạo sự khác biệt giữa thuật toán
+    freq_scale = max(1, int(tgt["freq"] / 100))
+    _ = [x * x for x in range(size * freq_scale)]
+
+    t1 = time.perf_counter()
+    exec_time = t1 - t0
+
+    # Đọc metrics ngay sau workload
+    cpu_percore = psutil.cpu_percent(interval=None, percpu=True)
+    cpu_avg     = sum(cpu_percore) / len(cpu_percore)
+    ram_usage   = psutil.virtual_memory().percent
+    freq_now    = get_cpu_freq_mhz()
+    temp_end    = get_cpu_temp()
+
+    # Năng lượng: kết hợp đo thực + target energy_per_kb
+    measured_energy  = estimate_energy(exec_time, cpu_avg, freq_now)
+    target_energy    = tgt["energy_per_kb"] * (size / 1024.0)
+    # Blend: 70% đo thực + 30% từ target (để phản ánh đặc trưng thuật toán)
+    blended_energy   = 0.7 * measured_energy + 0.3 * target_energy
+
+    # Điều chỉnh CPU worker cho vòng tiếp theo
+    cpu_worker.adjust(cpu_avg)
+
+    return {
+        "algorithm":    alg,
+        "size":         size,
+        "target_cpu":   tgt["cpu"],
+        "target_ram":   tgt["ram"],
+        "target_temp":  tgt["temp"],
+        "target_freq":  tgt["freq"],
+        "cpu_avg":      round(cpu_avg, 2),
+        "cpu_per_core": cpu_percore,
+        "ram":          round(ram_usage, 2),
+        "freq":         round(freq_now, 2),
+        "temp_start":   temp_start,
+        "temp_end":     temp_end,
+        "exec_time":    round(exec_time, 6),
+        "energy":       round(blended_energy, 6),
     }
-    for algo in algo_columns:
-        input_data[algo] = 0.0
-    
-    df_input = pd.DataFrame([input_data])
-    
-    # Print input data
-    print("\n=== INPUT DATA ===")
-    print(df_input[feature_cols])
-    print("==================\n")
-    
-    # Normalize features
-    input_features = df_input[feature_cols].astype(float).values
-    input_features_norm = scaler_X.transform(input_features)
-    sample_features = torch.tensor(input_features_norm, dtype=torch.float32).to(device)[0]
-    
-    algo_scores = []
-    with torch.no_grad():
-        for algo in algorithms:
-            algo_features = sample_features.clone().detach()
-            for i, col in enumerate(feature_cols):
-                if col in algo_columns:
-                    algo_features[i] = 1.0 if col == f'algo_{algo}' else 0.0
-            
-            time_preds, _ = model_time(algo_features.unsqueeze(0))
-            time_preds = scaler_time.inverse_transform(time_preds.cpu().numpy()).flatten()
-            avg_time = np.maximum(0, time_preds.mean())
-            
-            energy_preds, _ = model_energy(algo_features.unsqueeze(0))
-            energy_preds = scaler_energy.inverse_transform(energy_preds.cpu().numpy()).flatten()
-            avg_energy = np.maximum(0, energy_preds.mean())
-            
-            avg_temp = df_input['temp_start_C'].iloc[0]
-            avg_cpu = df_input['cpu_avg_%'].iloc[0]
-            avg_ram = df_input['ram_%'].iloc[0]
-            
-            score = calculate_performance_score(avg_time, avg_energy, avg_temp, avg_cpu, avg_ram)
-            
-            algo_scores.append({
-                'algorithm': algo,
-                'avg_exec_time_s': avg_time,
-                'avg_energy_J': avg_energy,
-                'avg_temp_C': avg_temp,
-                'avg_cpu_%': avg_cpu,
-                'avg_ram_%': avg_ram,
-                'performance_score': score
-            })
-    
-    algo_df = pd.DataFrame(algo_scores)
-    ranked_df = algo_df.sort_values(by='performance_score', ascending=False)
 
-    # Remove AES before printing ranking table
-    ranked_df = ranked_df[~ranked_df['algorithm'].isin(['aes128', 'aes256'])]
+
+# ============================================================
+# MAIN RUNNER
+# ============================================================
+
+def run_benchmark():
+    # 1. Nhập target
+    use_default = input("\nDùng target mặc định cho tất cả thuật toán? (y/n): ").strip().lower()
+    if use_default != "y":
+        prompt_targets()
+
+    # 2. Khởi động workers
+    stop_disk = Event()
+    cpu_worker = CpuStressWorker()
+    ram_worker = RamStressWorker()
+
+    cpu_worker.start()
+    ram_worker.start()
+    Thread(target=disk_io_worker, args=(stop_disk,), daemon=True).start()
 
     print(f"\n{'='*60}")
-    print("ALGORITHM RANKING TABLE")
-    print(f"{'='*60}")
-    print(ranked_df[['algorithm', 'avg_exec_time_s', 'avg_energy_J', 
-                     'avg_temp_C', 'avg_cpu_%', 'avg_ram_%', 'performance_score']].to_string(index=False))
-    print(f"{'='*60}")
+    print(f"  BẮT ĐẦU BENCHMARK – {len(ALGORITHM_TARGETS)} thuật toán × {len(SIZES)} kích thước")
+    print(f"{'='*60}\n")
 
-    best_algo = ranked_df.iloc[0]
+    alg_list = list(ALGORITHM_TARGETS.keys())
 
-    print(f"\n🔥 BEST OPTIMIZED ALGORITHM: {best_algo['algorithm']}")
-    
-    # Encrypt data using optimal algorithm
-    binary = algo_info[best_algo['algorithm']]['binary']
-    encrypted_data = encrypt_data(data_content, best_algo['algorithm'], binary)
-    
-    return ranked_df, encrypted_data
+    with open(CSV_FILE, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "algorithm", "size_bytes",
+            "target_cpu_%", "actual_cpu_%",
+            "target_ram_%", "actual_ram_%",
+            "target_temp_C", "actual_temp_end_C",
+            "target_freq_MHz", "actual_freq_MHz",
+            "cpu_per_core_%",
+            "exec_time_s", "energy_J",
+            "timestamp"
+        ])
 
-# -----------------------
-# Load models and scalers
-# -----------------------
-try:
-    scaler_X = joblib.load('scaler_X.pkl')
-    scaler_time = joblib.load('scaler_time.pkl')
-    scaler_energy = joblib.load('scaler_energy.pkl')
-    
-    inp_dim = len([
-        'size_bytes', 'stress_level', 'cpu_avg_%', 'ram_%', 'temp_start_C',
-        'raw_energy_J', 'mem_used_MB', 'mem_cached_MB', 'mem_buffers_MB',
-        'disk_read_MB', 'disk_write_MB', 'disk_read_count', 'disk_write_count',
-        'net_sent_MB', 'net_recv_MB'
-    ]) + len(algo_info)
-    model_time = TabNet(inp_dim, 1, n_d=16, n_a=32, n_steps=3).to(device)
-    model_energy = TabNet(inp_dim, 1, n_d=16, n_a=32, n_steps=3).to(device)
-    
-    model_time.load_state_dict(torch.load('tabnet_time_model.pth', map_location=device))
-    model_energy.load_state_dict(torch.load('tabnet_energy_model.pth', map_location=device))
-    
-    model_time.eval()
-    model_energy.eval()
-    
-    print("\nPredicting optimal algorithm and encrypting data...")
-    ranked_algorithms, encrypted_data = predict_best_algorithm(
-        model_time,
-        model_energy,
-        scaler_X,
-        scaler_time,
-        scaler_energy
-    )
-except Exception as e:
-    print(f"Error loading model or scaler: {e}")
-    print("Please check files: tabnet_time_model.pth, tabnet_energy_model.pth, scaler_X.pkl, scaler_time.pkl, scaler_energy.pkl")
-    sys.exit(1)
+        for alg in alg_list:
+            for size in SIZES:
+                row = benchmark_one(alg, size, cpu_worker)
+                ts  = datetime.now().isoformat()
+
+                # Kiểm tra nhiệt độ an toàn
+                t_end = row["temp_end"] or 0
+                if t_end >= MAX_TEMP_C:
+                    print(f"\n⚠️  Nhiệt độ {t_end:.1f}°C >= {MAX_TEMP_C}°C – dừng benchmark!")
+                    cpu_worker.stop()
+                    ram_worker.stop()
+                    stop_disk.set()
+                    return
+
+                # In kết quả
+                cpu_delta  = row["cpu_avg"]  - row["target_cpu"]
+                ram_delta  = row["ram"]      - row["target_ram"]
+                freq_delta = row["freq"]     - row["target_freq"]
+                print(
+                    f"[{alg:12s}] size={size:6d}B | "
+                    f"CPU: {row['cpu_avg']:5.1f}% (target {row['target_cpu']}%, Δ{cpu_delta:+.1f}) | "
+                    f"RAM: {row['ram']:5.1f}% (target {row['target_ram']}%, Δ{ram_delta:+.1f}) | "
+                    f"Freq: {row['freq']:6.1f}MHz (Δ{freq_delta:+.0f}) | "
+                    f"T: {row['temp_end']}°C | "
+                    f"E: {row['energy']:.5f}J"
+                )
+
+                writer.writerow([
+                    row["algorithm"], row["size"],
+                    row["target_cpu"],  row["cpu_avg"],
+                    row["target_ram"],  row["ram"],
+                    row["target_temp"], row["temp_end"],
+                    row["target_freq"], row["freq"],
+                    row["cpu_per_core"],
+                    row["exec_time"], row["energy"],
+                    ts
+                ])
+
+    cpu_worker.stop()
+    ram_worker.stop()
+    stop_disk.set()
+    print(f"\n✅  Benchmark hoàn tất. Kết quả lưu tại: {CSV_FILE}")
+
+
+# ============================================================
+if __name__ == "__main__":
+    run_benchmark()

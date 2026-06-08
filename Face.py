@@ -108,10 +108,14 @@ class RamWorker:
     CHUNK = 64 * 1024 * 1024        # cấp / giải phóng từng 64 MB
 
     def __init__(self):
-        self._blocks     = []
-        self._target_gb  = 0.0
-        self._lock       = Lock()
-        self._stop       = Event()
+        self._blocks      = []
+        self._target_gb   = 0.0
+        self._lock        = Lock()
+        self._stop        = Event()
+        # Đo RAM hệ thống đang dùng TRƯỚC khi script chạy
+        # → chỉ cấp phát phần chênh lệch, không cộng dồn
+        self._baseline_gb = psutil.virtual_memory().used / 1024**3
+        print(f"  [RamWorker] RAM nền (baseline): {self._baseline_gb:.2f} GB")
 
     def set_target(self, gb):
         with self._lock:
@@ -120,16 +124,20 @@ class RamWorker:
     def _loop(self):
         while not self._stop.is_set():
             with self._lock:
-                tgt_bytes = int(self._target_gb * 1024**3)
+                tgt_gb = self._target_gb
 
-            current = sum(len(b) for b in self._blocks)
-            diff    = tgt_bytes - current
+            # Phần RAM script cần tự cấp phát = target - baseline
+            # Nếu baseline đã vượt target → không cấp thêm, giải phóng hết
+            need_gb   = max(0.0, tgt_gb - self._baseline_gb)
+            need_bytes = int(need_gb * 1024**3)
+            current   = sum(len(b) for b in self._blocks)
+            diff      = need_bytes - current
 
             if diff > self.CHUNK // 2:
                 alloc = min(diff, self.CHUNK)
                 try:
                     buf = bytearray(alloc)
-                    # Ghi thực để OS thực sự cấp phát (tránh lazy alloc)
+                    # Ghi thực để OS cấp phát ngay (tránh lazy alloc)
                     for i in range(0, len(buf), 4096):
                         buf[i] = 0xFF
                     self._blocks.append(buf)
@@ -197,16 +205,21 @@ class Controller:
             tgt_ram  = self.targets["ram_gb"]
             tgt_temp = self.targets["temp"]
 
-            cpu_ok  = abs(cur_cpu - tgt_cpu)          <= 3.0
-            ram_ok  = abs(ram_gb_used - tgt_ram)      <= 0.2
+            allocated_gb = sum(len(b) for b in self.ram_worker._blocks) / 1024**3
+            need_gb      = max(0.0, tgt_ram - self.ram_worker._baseline_gb)
+
+            cpu_ok  = abs(cur_cpu - tgt_cpu)            <= 3.0
+            ram_ok  = abs(allocated_gb - need_gb)        <= 0.2
             temp_ok = (cur_temp is not None and abs(cur_temp - tgt_temp) <= 3.0)
 
             status = "✅" if (cpu_ok and ram_ok) else "⏳"
 
+            allocated_gb = sum(len(b) for b in ram_worker._blocks) / 1024**3
             print(
                 f"\r{status} "
                 f"CPU: {cur_cpu:5.1f}% / target {tgt_cpu}%  |  "
-                f"RAM: {ram_gb_used:.2f}/{ram_total:.1f}GB / target {tgt_ram}GB  |  "
+                f"RAM total: {ram_gb_used:.2f}/{ram_total:.1f}GB  "
+                f"(script: +{allocated_gb:.2f}GB / cần +{max(0.0, tgt_ram - ram_worker._baseline_gb):.2f}GB)  |  "
                 f"Temp: {temp_str} / target {tgt_temp}°C  |  "
                 f"Freq: {freq_str}   ",
                 end="", flush=True

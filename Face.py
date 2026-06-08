@@ -1,379 +1,262 @@
-import os, time, subprocess, psutil, csv, random, math
-from datetime import datetime
+import os, time, psutil, subprocess
 from threading import Thread, Event, Lock
 
 # ============================================================
-# CẤU HÌNH THUẬT TOÁN VÀ TARGET MẶC ĐỊNH
-# Người dùng có thể thay đổi target cho từng thuật toán
+#  NHẬP TARGET TỪ NGƯỜI DÙNG
 # ============================================================
 
-ALGORITHM_TARGETS = {
-    # alg_name: { cpu_pct, ram_pct, temp_c, freq_mhz, energy_j_per_kb }
-    "ascon128":     {"cpu": 40, "ram": 25, "temp": 45, "freq": 1000, "energy_per_kb": 0.0008},
-    "ascon80pq":    {"cpu": 38, "ram": 24, "temp": 44, "freq": 1000, "energy_per_kb": 0.0007},
-    "speck32_64":   {"cpu": 55, "ram": 30, "temp": 52, "freq": 1200, "energy_per_kb": 0.0012},
-    "speck64_128":  {"cpu": 60, "ram": 32, "temp": 54, "freq": 1200, "energy_per_kb": 0.0014},
-    "present80":    {"cpu": 70, "ram": 35, "temp": 58, "freq": 1400, "energy_per_kb": 0.0020},
-    "present128":   {"cpu": 75, "ram": 38, "temp": 60, "freq": 1400, "energy_per_kb": 0.0022},
-    "aes128":       {"cpu": 65, "ram": 40, "temp": 56, "freq": 1500, "energy_per_kb": 0.0018},
-    "aes256":       {"cpu": 80, "ram": 45, "temp": 62, "freq": 1600, "energy_per_kb": 0.0028},
-    "chacha20":     {"cpu": 50, "ram": 28, "temp": 48, "freq": 1100, "energy_per_kb": 0.0010},
-    "grain128":     {"cpu": 45, "ram": 26, "temp": 46, "freq": 1050, "energy_per_kb": 0.0009},
-}
+def prompt_float(label, unit, default=None, min_val=None, max_val=None):
+    while True:
+        hint = f" [default: {default}{unit}]" if default is not None else ""
+        raw = input(f"  {label}{hint}: ").strip()
+        if raw == "" and default is not None:
+            return float(default)
+        try:
+            val = float(raw)
+            if min_val is not None and val < min_val:
+                print(f"    ⚠ Tối thiểu {min_val}{unit}")
+                continue
+            if max_val is not None and val > max_val:
+                print(f"    ⚠ Tối đa {max_val}{unit}")
+                continue
+            return val
+        except ValueError:
+            print("    ⚠ Nhập số hợp lệ")
 
-SIZES = [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+def get_input():
+    total_ram_gb = psutil.virtual_memory().total / (1024**3)
+    print("\n" + "="*50)
+    print("  NHẬP TARGET HỆ THỐNG")
+    print("="*50)
+    print(f"  (RAM vật lý hiện có: {total_ram_gb:.1f} GB)\n")
 
-BASE_POWER_W  = 2.5
-MAX_POWER_W   = 7.0
-MAX_TEMP_C    = 70.0
-CSV_FILE      = "pi4_crypto_benchmark_targeted.csv"
+    targets = {}
+    targets["cpu"]  = prompt_float("CPU usage",  "%",   default=50,   min_val=0,   max_val=95)
+    targets["ram_gb"] = prompt_float("RAM usage", " GB", default=1.0,  min_val=0.1, max_val=round(total_ram_gb * 0.85, 1))
+    targets["temp"] = prompt_float("Nhiệt độ CPU target", "°C", default=50, min_val=30, max_val=75)
 
-# Tolerance: cho phép lệch bao nhiêu % so với target trước khi điều chỉnh
-CPU_TOLERANCE  = 3.0   # ±3%
-RAM_TOLERANCE  = 3.0   # ±3%
+    print()
+    return targets
 
 # ============================================================
-# TRẠNG THÁI TOÀN CỤC – được stress workers đọc liên tục
-# ============================================================
-state_lock    = Lock()
-target_cpu    = 0.0   # % target CPU
-target_ram    = 0.0   # % target RAM
-target_freq   = 1500  # MHz (dùng để scale workload)
-
-# ============================================================
-# HELPERS
+#  ĐỌC NHIỆT ĐỘ CPU
 # ============================================================
 
 def get_cpu_temp():
+    # Raspberry Pi
     try:
-        out = subprocess.check_output(["vcgencmd", "measure_temp"]).decode().strip()
-        return float(out.replace("temp=", "").replace("'C", ""))
-    except:
-        # Fallback cho môi trường không phải Pi
-        try:
-            temps = psutil.sensors_temperatures()
-            for key in ("cpu_thermal", "coretemp", "k10temp"):
-                if key in temps and temps[key]:
-                    return temps[key][0].current
-        except:
-            pass
-        return None
-
-def get_cpu_freq_mhz():
+        out = subprocess.check_output(["vcgencmd", "measure_temp"], stderr=subprocess.DEVNULL).decode()
+        return float(out.replace("temp=", "").replace("'C", "").strip())
+    except Exception:
+        pass
+    # Linux chung (psutil)
     try:
-        return psutil.cpu_freq().current
-    except:
-        return 0.0
-
-def estimate_energy(exec_time_s, cpu_pct, freq_mhz):
-    freq_ratio = min(freq_mhz / 1800.0, 1.0) if freq_mhz > 0 else 0.8
-    avg_power  = BASE_POWER_W + (MAX_POWER_W - BASE_POWER_W) * (cpu_pct / 100.0) * freq_ratio
-    return avg_power * exec_time_s
-
-# ============================================================
-# NHẬP TARGET TỪ NGƯỜI DÙNG
-# ============================================================
-
-def prompt_targets():
-    """Cho phép người dùng chỉnh target cho từng thuật toán hoặc dùng default."""
-    print("\n" + "="*60)
-    print("  CẤU HÌNH TARGET CHO TỪNG THUẬT TOÁN")
-    print("="*60)
-    print("Nhấn Enter để dùng giá trị mặc định.\n")
-
-    for alg, defaults in ALGORITHM_TARGETS.items():
-        print(f"  [{alg}]")
-        for param, default_val in defaults.items():
-            unit = {"cpu": "%", "ram": "%", "temp": "°C", "freq": "MHz", "energy_per_kb": "J/KB"}[param]
-            raw = input(f"    {param} target [{default_val}{unit}]: ").strip()
-            if raw:
-                try:
-                    ALGORITHM_TARGETS[alg][param] = float(raw)
-                except ValueError:
-                    print(f"    ⚠ Giá trị không hợp lệ, dùng mặc định {default_val}")
-        print()
+        temps = psutil.sensors_temperatures()
+        for key in ("cpu_thermal", "coretemp", "k10temp", "acpitz"):
+            if key in temps and temps[key]:
+                return temps[key][0].current
+    except Exception:
+        pass
+    return None
 
 # ============================================================
-# CPU STRESS WORKER – feedback loop để đạt target_cpu
+#  CPU STRESS WORKER  (busy-loop có điều chỉnh duty cycle)
 # ============================================================
 
-class CpuStressWorker:
+class CpuWorker:
     """
-    Điều chỉnh workload liên tục để giữ CPU usage gần target_cpu.
-    Dùng thuật toán PID đơn giản (chỉ P + I).
+    Mỗi logical core có 1 thread.
+    Duty cycle (0.0–1.0) điều chỉnh tỷ lệ thời gian "bận" / "nghỉ"
+    để ép CPU% bám target.
     """
     def __init__(self):
-        self.stop_event = Event()
-        self._threads   = []
-        self._intensity = 0.5   # 0.0 – 1.0: tỷ lệ thời gian "bận"
-        self._lock      = Lock()
+        self._duty   = 0.0          # 0 = idle hoàn toàn, 1 = full load
+        self._lock   = Lock()
+        self._stop   = Event()
+        self._n_core = psutil.cpu_count(logical=True)
 
-    def _worker(self):
-        while not self.stop_event.is_set():
+    def _core_loop(self):
+        SLOT = 0.05                 # mỗi slot 50 ms
+        while not self._stop.is_set():
             with self._lock:
-                busy_ratio = self._intensity
-            busy_time = 0.02 * busy_ratio
-            idle_time = 0.02 * (1.0 - busy_ratio)
+                d = self._duty
+            busy = SLOT * d
+            idle = SLOT * (1.0 - d)
+            if busy > 0:
+                end = time.perf_counter() + busy
+                while time.perf_counter() < end:
+                    pass            # spin – tạo tải CPU
+            if idle > 0:
+                time.sleep(idle)
 
-            deadline = time.perf_counter() + busy_time
-            while time.perf_counter() < deadline:
-                _ = sum(x*x for x in range(2000))
+    def start(self):
+        for _ in range(self._n_core):
+            Thread(target=self._core_loop, daemon=True).start()
 
-            if idle_time > 0:
-                time.sleep(idle_time)
-
-    def start(self, n_threads=None):
-        n = n_threads or psutil.cpu_count(logical=True)
-        for _ in range(n):
-            t = Thread(target=self._worker, daemon=True)
-            t.start()
-            self._threads.append(t)
-
-    def adjust(self, current_cpu):
-        """Điều chỉnh intensity dựa trên sai lệch so với target."""
-        with state_lock:
-            t_cpu = target_cpu
-        error = t_cpu - current_cpu
+    def set_duty(self, d):
         with self._lock:
-            self._intensity = max(0.0, min(1.0, self._intensity + error * 0.015))
+            self._duty = max(0.0, min(1.0, d))
 
     def stop(self):
-        self.stop_event.set()
-
+        self._stop.set()
 
 # ============================================================
-# RAM STRESS WORKER – feedback loop để đạt target_ram
+#  RAM STRESS WORKER  (giữ số GB đã cấp phát)
 # ============================================================
 
-class RamStressWorker:
+class RamWorker:
+    CHUNK = 64 * 1024 * 1024        # cấp / giải phóng từng 64 MB
+
     def __init__(self):
-        self.stop_event = Event()
-        self._blocks    = []
-        self._lock      = Lock()
+        self._blocks     = []
+        self._target_gb  = 0.0
+        self._lock       = Lock()
+        self._stop       = Event()
 
-    def _worker(self):
-        total = psutil.virtual_memory().total
-        while not self.stop_event.is_set():
-            with state_lock:
-                t_ram = target_ram
-            mem       = psutil.virtual_memory()
-            current   = mem.percent
-            error     = t_ram - current
+    def set_target(self, gb):
+        with self._lock:
+            self._target_gb = gb
 
-            if error > RAM_TOLERANCE:
-                # Cần cấp phát thêm
-                alloc = int(total * min(error, 5.0) / 100.0)
+    def _loop(self):
+        while not self._stop.is_set():
+            with self._lock:
+                tgt_bytes = int(self._target_gb * 1024**3)
+
+            current = sum(len(b) for b in self._blocks)
+            diff    = tgt_bytes - current
+
+            if diff > self.CHUNK // 2:
+                alloc = min(diff, self.CHUNK)
                 try:
-                    with self._lock:
-                        self._blocks.append(bytearray(alloc))
+                    buf = bytearray(alloc)
+                    # Ghi thực để OS thực sự cấp phát (tránh lazy alloc)
+                    for i in range(0, len(buf), 4096):
+                        buf[i] = 0xFF
+                    self._blocks.append(buf)
                 except MemoryError:
                     pass
-            elif error < -RAM_TOLERANCE:
-                # Cần giải phóng bớt
-                with self._lock:
-                    if self._blocks:
-                        self._blocks.pop(0)
+
+            elif diff < -(self.CHUNK // 2) and self._blocks:
+                self._blocks.pop(0)
+
             time.sleep(0.1)
 
     def start(self):
-        t = Thread(target=self._worker, daemon=True)
-        t.start()
+        Thread(target=self._loop, daemon=True).start()
 
     def stop(self):
-        self.stop_event.set()
-        with self._lock:
-            self._blocks.clear()
-
+        self._stop.set()
+        self._blocks.clear()
 
 # ============================================================
-# DISK I/O WORKER (phụ trợ, không có target riêng)
+#  FEEDBACK CONTROLLER  (vòng điều khiển chính)
 # ============================================================
 
-def disk_io_worker(stop_event):
-    while not stop_event.is_set():
-        try:
-            fname = "/tmp/bench_io.tmp"
-            with open(fname, "wb") as f:
-                f.write(os.urandom(1024 * 1024))
-            with open(fname, "rb") as f:
-                _ = f.read()
-            os.remove(fname)
-        except Exception:
-            pass
-        time.sleep(0.2)
+class Controller:
+    # Hệ số PID cho CPU
+    KP_CPU = 0.02
+    KI_CPU = 0.005
 
+    def __init__(self, targets, cpu_worker, ram_worker):
+        self.targets    = targets
+        self.cpu_worker = cpu_worker
+        self.ram_worker = ram_worker
+        self._stop      = Event()
+        self._i_cpu     = 0.0      # tích phân PID
 
-# ============================================================
-# STABILIZE: chờ CPU & RAM ổn định tại target trước khi đo
-# ============================================================
+        # Khởi tạo duty ở mức xấp xỉ target / 100
+        self.cpu_worker.set_duty(targets["cpu"] / 100.0 * 0.8)
+        self.ram_worker.set_target(targets["ram_gb"])
 
-def stabilize(cpu_worker, target_c, target_r, timeout=10.0):
-    """
-    Chờ tối đa `timeout` giây để CPU và RAM đạt gần target.
-    Trả về True nếu ổn định, False nếu timeout.
-    """
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        cur_cpu = psutil.cpu_percent(interval=0.3)
-        cur_ram = psutil.virtual_memory().percent
-        cpu_worker.adjust(cur_cpu)
+    def _loop(self):
+        while not self._stop.is_set():
+            cur_cpu  = psutil.cpu_percent(interval=0.5)
+            cur_ram  = psutil.virtual_memory()
+            cur_temp = get_cpu_temp()
+            cur_freq = psutil.cpu_freq()
 
-        cpu_ok = abs(cur_cpu - target_c) <= CPU_TOLERANCE * 1.5
-        ram_ok = abs(cur_ram - target_r) <= RAM_TOLERANCE * 1.5
-        if cpu_ok and ram_ok:
-            return True
-        time.sleep(0.2)
-    return False
+            # ---- CPU PID ----
+            err_cpu       = self.targets["cpu"] - cur_cpu
+            self._i_cpu   = max(-1.0, min(1.0, self._i_cpu + err_cpu * self.KI_CPU))
+            delta         = err_cpu * self.KP_CPU + self._i_cpu
+            # Đọc duty hiện tại rồi cộng delta
+            with self.cpu_worker._lock:
+                old_duty = self.cpu_worker._duty
+            self.cpu_worker.set_duty(old_duty + delta)
 
+            # ---- RAM (đã set 1 lần, worker tự duy trì) ----
+            # Không cần điều chỉnh thêm
 
-# ============================================================
-# BENCHMARK MỘT THUẬT TOÁN + SIZE
-# ============================================================
+            # ---- In trạng thái ----
+            ram_gb_used = cur_ram.used / 1024**3
+            ram_total   = cur_ram.total / 1024**3
+            temp_str    = f"{cur_temp:.1f}°C" if cur_temp else "N/A"
+            freq_str    = f"{cur_freq.current:.0f}MHz" if cur_freq else "N/A"
 
-def benchmark_one(alg, size, cpu_worker):
-    tgt = ALGORITHM_TARGETS[alg]
+            tgt_cpu  = self.targets["cpu"]
+            tgt_ram  = self.targets["ram_gb"]
+            tgt_temp = self.targets["temp"]
 
-    # Cập nhật target toàn cục cho workers
-    with state_lock:
-        global target_cpu, target_ram, target_freq
-        target_cpu  = tgt["cpu"]
-        target_ram  = tgt["ram"]
-        target_freq = tgt["freq"]
+            cpu_ok  = abs(cur_cpu - tgt_cpu)          <= 3.0
+            ram_ok  = abs(ram_gb_used - tgt_ram)      <= 0.2
+            temp_ok = (cur_temp is not None and abs(cur_temp - tgt_temp) <= 3.0)
 
-    # Điều chỉnh & ổn định
-    cpu_worker.adjust(psutil.cpu_percent(interval=0.2))
-    stabilize(cpu_worker, tgt["cpu"], tgt["ram"], timeout=8.0)
+            status = "✅" if (cpu_ok and ram_ok) else "⏳"
 
-    # --- ĐO ---
-    temp_start = get_cpu_temp()
+            print(
+                f"\r{status} "
+                f"CPU: {cur_cpu:5.1f}% / target {tgt_cpu}%  |  "
+                f"RAM: {ram_gb_used:.2f}/{ram_total:.1f}GB / target {tgt_ram}GB  |  "
+                f"Temp: {temp_str} / target {tgt_temp}°C  |  "
+                f"Freq: {freq_str}   ",
+                end="", flush=True
+            )
 
-    # Reset counter trước khi đo
-    psutil.cpu_percent(interval=None)
-    t0 = time.perf_counter()
+            # Cảnh báo nếu quá nhiệt
+            if cur_temp and cur_temp >= 75.0:
+                print(f"\n⚠️  Nhiệt độ {cur_temp:.1f}°C quá cao! Đang giảm tải...")
+                self.cpu_worker.set_duty(0.1)
 
-    # Workload thực tế – scale theo freq target để tạo sự khác biệt giữa thuật toán
-    freq_scale = max(1, int(tgt["freq"] / 100))
-    _ = [x * x for x in range(size * freq_scale)]
+    def start(self):
+        Thread(target=self._loop, daemon=True).start()
 
-    t1 = time.perf_counter()
-    exec_time = t1 - t0
-
-    # Đọc metrics ngay sau workload
-    cpu_percore = psutil.cpu_percent(interval=None, percpu=True)
-    cpu_avg     = sum(cpu_percore) / len(cpu_percore)
-    ram_usage   = psutil.virtual_memory().percent
-    freq_now    = get_cpu_freq_mhz()
-    temp_end    = get_cpu_temp()
-
-    # Năng lượng: kết hợp đo thực + target energy_per_kb
-    measured_energy  = estimate_energy(exec_time, cpu_avg, freq_now)
-    target_energy    = tgt["energy_per_kb"] * (size / 1024.0)
-    # Blend: 70% đo thực + 30% từ target (để phản ánh đặc trưng thuật toán)
-    blended_energy   = 0.7 * measured_energy + 0.3 * target_energy
-
-    # Điều chỉnh CPU worker cho vòng tiếp theo
-    cpu_worker.adjust(cpu_avg)
-
-    return {
-        "algorithm":    alg,
-        "size":         size,
-        "target_cpu":   tgt["cpu"],
-        "target_ram":   tgt["ram"],
-        "target_temp":  tgt["temp"],
-        "target_freq":  tgt["freq"],
-        "cpu_avg":      round(cpu_avg, 2),
-        "cpu_per_core": cpu_percore,
-        "ram":          round(ram_usage, 2),
-        "freq":         round(freq_now, 2),
-        "temp_start":   temp_start,
-        "temp_end":     temp_end,
-        "exec_time":    round(exec_time, 6),
-        "energy":       round(blended_energy, 6),
-    }
-
+    def stop(self):
+        self._stop.set()
 
 # ============================================================
-# MAIN RUNNER
+#  MAIN
 # ============================================================
 
-def run_benchmark():
-    # 1. Nhập target
-    use_default = input("\nDùng target mặc định cho tất cả thuật toán? (y/n): ").strip().lower()
-    if use_default != "y":
-        prompt_targets()
+def main():
+    targets = get_input()
 
-    # 2. Khởi động workers
-    stop_disk = Event()
-    cpu_worker = CpuStressWorker()
-    ram_worker = RamStressWorker()
+    print("\n" + "="*50)
+    print("  TARGET ĐÃ ĐẶT:")
+    print(f"    CPU  : {targets['cpu']}%")
+    print(f"    RAM  : {targets['ram_gb']} GB")
+    print(f"    Temp : {targets['temp']}°C (theo dõi, không thể ép trực tiếp)")
+    print("="*50)
+    print("\nĐang khởi động workers...")
+    print("Nhấn  Ctrl+C  để dừng.\n")
+
+    cpu_worker = CpuWorker()
+    ram_worker = RamWorker()
+    controller = Controller(targets, cpu_worker, ram_worker)
 
     cpu_worker.start()
     ram_worker.start()
-    Thread(target=disk_io_worker, args=(stop_disk,), daemon=True).start()
+    controller.start()
 
-    print(f"\n{'='*60}")
-    print(f"  BẮT ĐẦU BENCHMARK – {len(ALGORITHM_TARGETS)} thuật toán × {len(SIZES)} kích thước")
-    print(f"{'='*60}\n")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n\nĐang dừng...")
+        controller.stop()
+        cpu_worker.stop()
+        ram_worker.stop()
+        time.sleep(0.5)
+        print("Đã dừng. Bye!")
 
-    alg_list = list(ALGORITHM_TARGETS.keys())
-
-    with open(CSV_FILE, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "algorithm", "size_bytes",
-            "target_cpu_%", "actual_cpu_%",
-            "target_ram_%", "actual_ram_%",
-            "target_temp_C", "actual_temp_end_C",
-            "target_freq_MHz", "actual_freq_MHz",
-            "cpu_per_core_%",
-            "exec_time_s", "energy_J",
-            "timestamp"
-        ])
-
-        for alg in alg_list:
-            for size in SIZES:
-                row = benchmark_one(alg, size, cpu_worker)
-                ts  = datetime.now().isoformat()
-
-                # Kiểm tra nhiệt độ an toàn
-                t_end = row["temp_end"] or 0
-                if t_end >= MAX_TEMP_C:
-                    print(f"\n⚠️  Nhiệt độ {t_end:.1f}°C >= {MAX_TEMP_C}°C – dừng benchmark!")
-                    cpu_worker.stop()
-                    ram_worker.stop()
-                    stop_disk.set()
-                    return
-
-                # In kết quả
-                cpu_delta  = row["cpu_avg"]  - row["target_cpu"]
-                ram_delta  = row["ram"]      - row["target_ram"]
-                freq_delta = row["freq"]     - row["target_freq"]
-                print(
-                    f"[{alg:12s}] size={size:6d}B | "
-                    f"CPU: {row['cpu_avg']:5.1f}% (target {row['target_cpu']}%, Δ{cpu_delta:+.1f}) | "
-                    f"RAM: {row['ram']:5.1f}% (target {row['target_ram']}%, Δ{ram_delta:+.1f}) | "
-                    f"Freq: {row['freq']:6.1f}MHz (Δ{freq_delta:+.0f}) | "
-                    f"T: {row['temp_end']}°C | "
-                    f"E: {row['energy']:.5f}J"
-                )
-
-                writer.writerow([
-                    row["algorithm"], row["size"],
-                    row["target_cpu"],  row["cpu_avg"],
-                    row["target_ram"],  row["ram"],
-                    row["target_temp"], row["temp_end"],
-                    row["target_freq"], row["freq"],
-                    row["cpu_per_core"],
-                    row["exec_time"], row["energy"],
-                    ts
-                ])
-
-    cpu_worker.stop()
-    ram_worker.stop()
-    stop_disk.set()
-    print(f"\n✅  Benchmark hoàn tất. Kết quả lưu tại: {CSV_FILE}")
-
-
-# ============================================================
 if __name__ == "__main__":
-    run_benchmark()
+    main()

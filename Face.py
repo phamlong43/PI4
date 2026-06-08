@@ -1,9 +1,10 @@
-import os, time, psutil, subprocess, ctypes
+import time, psutil, subprocess
+from collections import deque
 from threading import Thread, Event, Lock
 from multiprocessing import Process, Value, Event as MpEvent
 
 # ============================================================
-#  NHẬP TARGET TỪ NGƯỜI DÙNG
+#  NHẬP TARGET
 # ============================================================
 
 def prompt_float(label, unit, default=None, min_val=None, max_val=None):
@@ -15,11 +16,9 @@ def prompt_float(label, unit, default=None, min_val=None, max_val=None):
         try:
             val = float(raw)
             if min_val is not None and val < min_val:
-                print(f"    ⚠ Tối thiểu {min_val}{unit}")
-                continue
+                print(f"    ⚠ Tối thiểu {min_val}{unit}"); continue
             if max_val is not None and val > max_val:
-                print(f"    ⚠ Tối đa {max_val}{unit}")
-                continue
+                print(f"    ⚠ Tối đa {max_val}{unit}"); continue
             return val
         except ValueError:
             print("    ⚠ Nhập số hợp lệ")
@@ -30,7 +29,6 @@ def get_input():
     print("  NHẬP TARGET HỆ THỐNG")
     print("="*50)
     print(f"  (RAM vật lý hiện có: {total_ram_gb:.1f} GB)\n")
-
     targets = {}
     targets["cpu"]    = prompt_float("CPU usage",           "%",   default=50,  min_val=0,   max_val=95)
     targets["ram_gb"] = prompt_float("RAM usage",           " GB", default=1.0, min_val=0.1, max_val=round(total_ram_gb * 0.85, 1))
@@ -39,7 +37,7 @@ def get_input():
     return targets
 
 # ============================================================
-#  ĐỌC NHIỆT ĐỘ CPU
+#  ĐỌC NHIỆT ĐỘ
 # ============================================================
 
 def get_cpu_temp():
@@ -58,15 +56,10 @@ def get_cpu_temp():
     return None
 
 # ============================================================
-#  CPU STRESS – dùng multiprocessing để bypass GIL
-#
-#  Mỗi core có 1 Process riêng (GIL độc lập).
-#  shared_duty: Value('d') dùng chung giữa controller và workers.
-#  Mỗi worker đọc duty rồi spin / sleep theo tỷ lệ đó.
+#  CPU WORKER  (multiprocessing — bypass GIL)
 # ============================================================
 
 def _cpu_worker_proc(shared_duty, stop_event):
-    """Chạy trong Process riêng — không bị GIL chặn."""
     SLOT = 0.02
     while not stop_event.is_set():
         d    = shared_duty.value
@@ -79,19 +72,17 @@ def _cpu_worker_proc(shared_duty, stop_event):
         if idle > 0:
             time.sleep(idle)
 
-
 class CpuWorker:
     def __init__(self):
         self._n_core    = psutil.cpu_count(logical=True)
-        self._duty      = Value('d', 0.0)   # shared memory double
+        self._duty      = Value('d', 0.0)
         self._stop      = MpEvent()
         self._processes = []
 
     def start(self):
         for _ in range(self._n_core):
             p = Process(target=_cpu_worker_proc,
-                        args=(self._duty, self._stop),
-                        daemon=True)
+                        args=(self._duty, self._stop), daemon=True)
             p.start()
             self._processes.append(p)
 
@@ -107,7 +98,7 @@ class CpuWorker:
             p.terminate()
 
 # ============================================================
-#  RAM STRESS WORKER  (giữ số GB đã cấp phát)
+#  RAM WORKER
 # ============================================================
 
 class RamWorker:
@@ -129,16 +120,12 @@ class RamWorker:
         while not self._stop.is_set():
             with self._lock:
                 tgt_gb = self._target_gb
-
-            need_gb    = max(0.0, tgt_gb - self._baseline_gb)
-            need_bytes = int(need_gb * 1024**3)
+            need_bytes = int(max(0.0, tgt_gb - self._baseline_gb) * 1024**3)
             current    = sum(len(b) for b in self._blocks)
             diff       = need_bytes - current
-
             if diff > self.CHUNK // 2:
-                alloc = min(diff, self.CHUNK)
                 try:
-                    buf = bytearray(alloc)
+                    buf = bytearray(min(diff, self.CHUNK))
                     for i in range(0, len(buf), 4096):
                         buf[i] = 0xFF
                     self._blocks.append(buf)
@@ -146,7 +133,6 @@ class RamWorker:
                     pass
             elif diff < -(self.CHUNK // 2) and self._blocks:
                 self._blocks.pop(0)
-
             time.sleep(0.1)
 
     def start(self):
@@ -157,76 +143,95 @@ class RamWorker:
         self._blocks.clear()
 
 # ============================================================
-#  FEEDBACK CONTROLLER  (PID — chạy trong main process)
+#  CONTROLLER
+#
+#  Hai fix chính so với version trước:
+#
+#  FIX 1 — MOVING AVERAGE (smoothing)
+#    psutil.cpu_percent() rất nhiễu khi đọc mỗi 100ms.
+#    Lấy trung bình 5 mẫu gần nhất trước khi đưa vào PID
+#    → loại bỏ spike ngẫu nhiên, PID không phản ứng với nhiễu.
+#
+#  FIX 2 — PID điều chỉnh DUTY trực tiếp, không cộng delta
+#    Thay vì: duty += delta  (tích lũy sai số, dễ overshoot)
+#    Dùng:    duty  = clamp(target_cpu/100 + P + I)
+#    → duty luôn bám sát giá trị hợp lý, không drift.
+#    KP nhỏ hơn (0.008) để tránh phản ứng quá mạnh.
 # ============================================================
 
 class Controller:
-    KP_CPU = 0.05
-    KI_CPU = 0.02
+    KP      = 0.008   # nhỏ hơn để tránh overshoot
+    KI      = 0.003   # tích phân chậm, chỉ bù steady-state error
+    SMOOTH  = 8       # số mẫu moving average
 
     def __init__(self, targets, cpu_worker, ram_worker):
         self.targets    = targets
         self.cpu_worker = cpu_worker
         self.ram_worker = ram_worker
         self._stop      = Event()
-        self._i_cpu     = 0.0
+        self._integral  = 0.0
+        self._samples   = deque(maxlen=self.SMOOTH)
 
-        # Khởi tạo duty đúng bằng target
         self.cpu_worker.set_duty(targets["cpu"] / 100.0)
         self.ram_worker.set_target(targets["ram_gb"])
 
+    def _smooth_cpu(self, raw):
+        """Thêm mẫu mới, trả về trung bình SMOOTH mẫu gần nhất."""
+        self._samples.append(raw)
+        return sum(self._samples) / len(self._samples)
+
     def _loop(self):
-        # Warm-up: discard lần đọc đầu tiên (psutil trả 0.0)
+        # Warm-up: nạp đủ SMOOTH mẫu trước khi PID bắt đầu
         psutil.cpu_percent()
-        time.sleep(0.5)
+        for _ in range(self.SMOOTH):
+            self._samples.append(psutil.cpu_percent(interval=0.2))
 
         while not self._stop.is_set():
-            cur_cpu  = psutil.cpu_percent(interval=None)
+            raw_cpu  = psutil.cpu_percent(interval=0.2)   # interval=0.2: ít nhiễu hơn None
+            cur_cpu  = self._smooth_cpu(raw_cpu)           # FIX 1: làm mượt
+
             cur_ram  = psutil.virtual_memory()
             cur_temp = get_cpu_temp()
             cur_freq = psutil.cpu_freq()
 
-            # ---- CPU PID ----
-            err_cpu     = self.targets["cpu"] - cur_cpu
-            self._i_cpu = max(-1.0, min(1.0, self._i_cpu + err_cpu * self.KI_CPU))
-            delta       = err_cpu * self.KP_CPU + self._i_cpu
-            self.cpu_worker.set_duty(self.cpu_worker.get_duty() + delta)
+            tgt_cpu = self.targets["cpu"]
 
-            # ---- In trạng thái ----
-            ram_gb_used  = cur_ram.used / 1024**3
-            ram_total    = cur_ram.total / 1024**3
+            # ---- PID ----
+            err = tgt_cpu - cur_cpu
+            self._integral = max(-5.0, min(5.0,           # anti-windup
+                                self._integral + err * self.KI))
+
+            # FIX 2: duty tính trực tiếp từ feedforward + correction
+            # feedforward = target/100 (điểm xuất phát hợp lý)
+            # correction  = P + I      (bù sai lệch)
+            duty = (tgt_cpu / 100.0) + err * self.KP + self._integral / 100.0
+            self.cpu_worker.set_duty(duty)
+
+            # ---- Hiển thị ----
+            ram_used_gb  = cur_ram.used / 1024**3
+            ram_total_gb = cur_ram.total / 1024**3
+            alloc_gb     = sum(len(b) for b in self.ram_worker._blocks) / 1024**3
+            need_gb      = max(0.0, self.targets["ram_gb"] - self.ram_worker._baseline_gb)
             temp_str     = f"{cur_temp:.1f}°C" if cur_temp else "N/A"
             freq_str     = f"{cur_freq.current:.0f}MHz" if cur_freq else "N/A"
 
-            tgt_cpu  = self.targets["cpu"]
-            tgt_ram  = self.targets["ram_gb"]
-            tgt_temp = self.targets["temp"]
-
-            allocated_gb = sum(len(b) for b in self.ram_worker._blocks) / 1024**3
-            need_gb      = max(0.0, tgt_ram - self.ram_worker._baseline_gb)
-
-            cpu_ok  = abs(cur_cpu - tgt_cpu)      <= 3.0
-            ram_ok  = abs(allocated_gb - need_gb) <= 0.2
-            status  = "✅" if (cpu_ok and ram_ok) else "⏳"
+            cpu_ok = abs(cur_cpu - tgt_cpu) <= 3.0
+            ram_ok = abs(alloc_gb - need_gb) <= 0.2
+            status = "✅" if (cpu_ok and ram_ok) else "⏳"
 
             print(
                 f"\r{status} "
-                f"CPU: {cur_cpu:5.1f}% / target {tgt_cpu}%  |  "
-                f"duty: {self.cpu_worker.get_duty():.2f}  |  "
-                f"RAM: {ram_gb_used:.2f}/{ram_total:.1f}GB "
-                f"(+{allocated_gb:.2f}/{need_gb:.2f}GB)  |  "
-                f"Temp: {temp_str} / {tgt_temp}°C  |  "
-                f"Freq: {freq_str}   ",
+                f"CPU: {cur_cpu:5.1f}% (raw:{raw_cpu:5.1f}%) / {tgt_cpu}%  |  "
+                f"duty: {self.cpu_worker.get_duty():.3f}  |  "
+                f"RAM: {ram_used_gb:.2f}/{ram_total_gb:.1f}GB (+{alloc_gb:.2f}/{need_gb:.2f}GB)  |  "
+                f"Temp: {temp_str}/{self.targets['temp']}°C  Freq: {freq_str}   ",
                 end="", flush=True
             )
 
-            # Cảnh báo quá nhiệt
             if cur_temp and cur_temp >= 75.0:
-                print(f"\n⚠️  Nhiệt độ {cur_temp:.1f}°C quá cao! Đang giảm tải...")
+                print(f"\n⚠️  Nhiệt độ {cur_temp:.1f}°C quá cao! Giảm tải...")
                 self.cpu_worker.set_duty(0.1)
-                self._i_cpu = 0.0   # reset tích phân tránh windup
-
-            time.sleep(0.1)
+                self._integral = 0.0
 
     def start(self):
         Thread(target=self._loop, daemon=True).start()
@@ -245,7 +250,7 @@ def main():
     print("  TARGET ĐÃ ĐẶT:")
     print(f"    CPU  : {targets['cpu']}%")
     print(f"    RAM  : {targets['ram_gb']} GB")
-    print(f"    Temp : {targets['temp']}°C (theo dõi, không thể ép trực tiếp)")
+    print(f"    Temp : {targets['temp']}°C (theo dõi, không ép trực tiếp)")
     print("="*50)
     print("\nĐang khởi động workers...")
     print("Nhấn  Ctrl+C  để dừng.\n")
@@ -269,6 +274,5 @@ def main():
         time.sleep(0.5)
         print("Đã dừng. Bye!")
 
-# multiprocessing trên Windows/macOS cần guard này
 if __name__ == "__main__":
     main()
